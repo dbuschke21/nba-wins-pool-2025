@@ -13,43 +13,60 @@ SEASON = "2025-26"  # <-- update each season
 # ----------------------------
 # Data source (NBA standings)
 # ----------------------------
+@st.cache_data(ttl=900)
 def fetch_nba_standings() -> pd.DataFrame:
-    """
-    Returns df with columns: Team, Abbr, W, L, WinPct
-    """
-    url = "https://stats.nba.com/stats/leaguestandingsv3"
-    params = {"LeagueID": "00", "Season": SEASON, "SeasonType": "Regular Season"}
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://www.nba.com/",
-        "Origin": "https://www.nba.com",
-    }
-    r = requests.get(url, params=params, headers=headers, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    rs = data["resultSets"][0]
-    headers = [h["name"] for h in rs["headers"]]
-    rows = rs["rowSet"]
-
-    raw = pd.DataFrame(rows, columns=headers)
-    keep = raw.rename(
-        columns={
-            "TeamName": "Team",
-            "TeamCity": "City",
-            "TeamSlug": "Slug",
-            "WINS": "W",
-            "LOSSES": "L",
-            "WinPCT": "WinPct",
-            "TeamTricode": "Abbr",
-        }
-    )[["Team", "Abbr", "W", "L", "WinPct"]].copy()
-
-    keep["Team"] = keep["Team"].astype(str)
-    keep["W"] = keep["W"].astype(int)
-    keep["L"] = keep["L"].astype(int)
-    keep["WinPct"] = keep["WinPct"].astype(float)
-    return keep.sort_values("Team").reset_index(drop=True)
+	"""
+	    Uses ESPN's public JSON (no key) to get live standings.
+	    Returns: Team, Abbr, W, L, WinPct
+	    """
+	import requests
+	import pandas as pd
+	
+	# ESPN "hidden" API for NBA standings (unofficial but widely used)
+	# Can optionally add params like season, region, lang.
+	url = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/standings"
+	r = requests.get(url, timeout=20)
+	r.raise_for_status()
+	data = r.json()
+	
+	# Parse the standings rows
+	# Structure: data["children"][0]["standings"]["entries"] typically
+	# We’ll defensively search for the first child that has "standings"
+	children = data.get("children", [])
+	standings_block = None
+	for ch in children:
+	if "standings" in ch:
+	standings_block = ch["standings"]
+	break
+	if standings_block is None:
+	raise RuntimeError("ESPN standings format not found")
+	
+	rows = []
+	for entry in standings_block.get("entries", []):
+	team = entry.get("team", {})
+	name = team.get("displayName") or team.get("name")
+	abbr = team.get("abbreviation") or team.get("shortDisplayName")
+	
+	# ESPN stats live under "stats" list with id/value pairs
+	stats = {s.get("id"): s.get("value") for s in entry.get("stats", []) if "id" in s}
+	w = int(stats.get("wins", 0) or 0)
+	l = int(stats.get("losses", 0) or 0)
+	gp = w + l
+	winpct = float(stats.get("winPercent", 0) or (w / gp if gp else 0))
+	
+	rows.append(
+	{"Team": name, "Abbr": abbr, "W": w, "L": l, "WinPct": winpct}
+	)
+	
+	df = pd.DataFrame(rows)
+	if df.empty:
+	raise RuntimeError("No standings rows parsed from ESPN")
+	# Standardize + sort
+	df["Team"] = df["Team"].astype(str)
+	df["W"] = df["W"].astype(int)
+	df["L"] = df["L"].astype(int)
+	df["WinPct"] = df["WinPct"].astype(float)
+return df.sort_values("Team").reset_index(drop=True)
 
 # ----------------------------
 # Draft config persistence
