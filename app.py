@@ -2,10 +2,11 @@
 # ------------------------------------------------------------
 # Features:
 # - Reads/writes draft data from Google Sheets (tab 'Draft')
-# - Uses ESPN API for live NBA standings
+# - Uses ESPN API for live NBA standings (East + West)
 # - Scoring: 1 point per Win (or Loss) based on PointType
 # - Player Standings, Per-Team Breakdown, Raw Standings
 # - Refresh button, export Teams tab, mismatch detection, editor dropdowns
+# - Wider "Team" column for readability
 
 import difflib
 import pandas as pd
@@ -77,12 +78,12 @@ def export_teams_tab(gc, sheet_id, teams):
     ws.update(values)
 
 # ----------------------------
-# ESPN Standings fetch
+# ESPN Standings fetch (East + West)
 # ----------------------------
 @st.cache_data(ttl=900)
 def fetch_nba_standings() -> pd.DataFrame:
     """
-    Uses ESPN's public JSON API to get live standings.
+    Uses ESPN's public JSON API to get live standings across both conferences.
     Returns DataFrame with columns: Team, Abbr, W, L, WinPct
     """
     url = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/standings"
@@ -90,32 +91,37 @@ def fetch_nba_standings() -> pd.DataFrame:
     r.raise_for_status()
     data = r.json()
 
+    rows_map = {}  # team_id -> row dict (to avoid duplicates)
+
+    def harvest(standings_block):
+        for entry in standings_block.get("entries", []):
+            team = entry.get("team", {}) or {}
+            team_id = team.get("id") or team.get("uid") or (team.get("displayName") or team.get("name"))
+            name = team.get("displayName") or team.get("name")
+            abbr = team.get("abbreviation") or team.get("shortDisplayName")
+            stats = {s.get("id"): s.get("value") for s in entry.get("stats", []) if "id" in s}
+            w = int(stats.get("wins", 0) or 0)
+            l = int(stats.get("losses", 0) or 0)
+            gp = w + l
+            winpct = float(stats.get("winPercent,") if "winPercent," in stats else stats.get("winPercent", 0) or (w / gp if gp else 0))
+            rows_map[team_id] = {"Team": name, "Abbr": abbr, "W": w, "L": l, "WinPct": winpct}
+
+    # Newer ESPN format usually has children for East/West; gather all that contain "standings"
     children = data.get("children", [])
-    standings_block = None
+    found_any = False
     for ch in children:
         if "standings" in ch:
-            standings_block = ch["standings"]
-            break
+            harvest(ch["standings"])
+            found_any = True
 
-    if standings_block is None:
-        raise RuntimeError("ESPN standings format not found")
+    # Fallback: some shapes have standings at root
+    if not found_any and "standings" in data:
+        harvest(data["standings"])
 
-    rows = []
-    for entry in standings_block.get("entries", []):
-        team = entry.get("team", {})
-        name = team.get("displayName") or team.get("name")
-        abbr = team.get("abbreviation") or team.get("shortDisplayName")
-        stats = {s.get("id"): s.get("value") for s in entry.get("stats", []) if "id" in s}
-        w = int(stats.get("wins", 0) or 0)
-        l = int(stats.get("losses", 0) or 0)
-        gp = w + l
-        winpct = float(stats.get("winPercent", 0) or (w / gp if gp else 0))
-        rows.append({"Team": name, "Abbr": abbr, "W": w, "L": l, "WinPct": winpct})
-
-    df = pd.DataFrame(rows)
-    if df.empty:
+    if not rows_map:
         raise RuntimeError("No standings rows parsed from ESPN")
 
+    df = pd.DataFrame(list(rows_map.values()))
     df["Team"] = df["Team"].astype(str)
     df["W"] = df["W"].astype(int)
     df["L"] = df["L"].astype(int)
@@ -199,7 +205,7 @@ except Exception as e:
     st.error(f"❌ Could not load standings: {e}")
     st.stop()
 
-# Sidebar: refresh + editor
+# Sidebar: refresh
 with st.sidebar:
     if st.button("🔄 Refresh data (clear cache)"):
         fetch_nba_standings.clear()
@@ -236,7 +242,8 @@ if not bad.empty:
         lambda t: ", ".join(difflib.get_close_matches(t, team_list, n=3, cutoff=0.6)) or "(no close match)"
     )
     st.warning("Some team names in your Draft sheet don’t match ESPN’s names. Fix them in the Sheet or via the editor below.")
-    st.dataframe(bad, use_container_width=True)
+    st.dataframe(bad, use_container_width=True,
+                 column_config={"Team": column_config.TextColumn("Team", width="large")})
 
 # In-app editor with dropdowns
 st.sidebar.header("Draft Editor (saves to Google Sheets)")
@@ -248,7 +255,7 @@ editable_df = st.sidebar.data_editor(
     hide_index=True,
     column_config={
         "Player": column_config.TextColumn("Player"),
-        "Team": column_config.SelectboxColumn("Team", options=[""] + team_options, required=False),
+        "Team": column_config.SelectboxColumn("Team", options=[""] + team_options, required=False, width="large"),
         "PointType": column_config.SelectboxColumn("PointType", options=["Wins", "Losses"], required=True),
     }
 )
@@ -256,21 +263,17 @@ editable_df = st.sidebar.data_editor(
 # Save with guards (max 6 per player, no duplicate team across players)
 if st.sidebar.button("💾 Save Draft to Google Sheets"):
     df_clean = editable_df.copy().fillna("")
-    # remove empty team rows entirely
     df_clean = df_clean[df_clean["Team"] != ""]
-    # (a) limit 6 per player
     counts = df_clean.groupby("Player").size()
     offenders = [p for p, n in counts.items() if n > 6]
     if offenders:
         st.sidebar.error(f"Each player can have up to 6 teams. Offending: {', '.join(offenders)}")
         st.stop()
-    # (b) no duplicate team across players
     dups = df_clean.duplicated(subset=["Team"], keep=False)
     if dups.any():
         bad_teams = df_clean.loc[dups, "Team"].unique().tolist()
         st.sidebar.error(f"These teams appear more than once: {', '.join(bad_teams)}")
         st.stop()
-    # write
     entries = df_clean[["Player", "Team", "PointType"]].to_dict(orient="records")
     write_draft(gc, entries)
     st.sidebar.success("Draft saved to Google Sheets ✅")
@@ -287,7 +290,7 @@ st.dataframe(
     use_container_width=True
 )
 
-# Per-team breakdown (with filter)
+# Per-team breakdown (with filter) — wider "Team" column
 st.divider()
 col1, col2 = st.columns([1, 3])
 with col1:
@@ -301,19 +304,25 @@ if not per_team_table.empty:
     show_df = per_team_table if who == "All" else per_team_table[per_team_table["Player"] == who]
     st.dataframe(
         show_df[["Player", "Team", "Point Type", "Points", "W", "L", "GP", "Point %", "Win %"]],
-        use_container_width=True
+        use_container_width=True,
+        column_config={
+            "Team": column_config.TextColumn("Team", width="large"),
+            "Point Type": column_config.TextColumn("Point Type"),
+        }
     )
 else:
     st.info("Add draft rows (Player, Team, PointType) to your Google Sheet to see results.")
 
-# Raw standings and export Teams tab
+# Raw standings (league-wide) — wider "Team" column
 st.divider()
 st.subheader("NBA Standings (raw, from ESPN)")
 st.dataframe(
     standings_df[["Team", "Abbr", "W", "L", "WinPct"]].rename(columns={"WinPct": "Win %"}),
-    use_container_width=True
+    use_container_width=True,
+    column_config={"Team": column_config.TextColumn("Team", width="large")}
 )
 
+# Export Teams tab
 colA, colB = st.columns([1, 3])
 with colA:
     if st.button("📤 Export team list to 'Teams' sheet"):
@@ -328,6 +337,6 @@ with st.expander("ℹ️ Notes / Tips"):
     st.markdown(f"""
 - **Google Sheet Tab:** `{DRAFT_TAB}` • **Columns:** `Player, Team, PointType` (`Wins` or `Losses`)
 - **Use exact team names** as shown in the raw standings above (or apply data validation using the exported `Teams` tab).
-- **Season:** {SEASON} • **Standings source:** ESPN (cached 15 min)
+- **Season:** {SEASON} • **Standings source:** ESPN (cached 15 min, combined East + West)
 - **Guards:** Max 6 teams per player; a team can't belong to multiple players.
 """)
