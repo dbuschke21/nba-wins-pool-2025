@@ -1,12 +1,13 @@
 # app.py — NBA Wins/Losses Pool Tracker (Google Sheets + ESPN)
 # ------------------------------------------------------------
-# Features:
-# - Reads/writes draft data from Google Sheets (tab 'Draft')
-# - Uses ESPN API for live NBA standings (East + West)
-# - Scoring: 1 point per Win (or Loss) based on PointType
-# - Player Standings, Per-Team Breakdown, Raw Standings
-# - Refresh button, export Teams tab, mismatch detection, editor dropdowns
-# - Wider "Team" column for readability
+# Tweaks for presentation:
+# - Index from 1 (# col)
+# - Short headers: PLYR, TM, PT, P, P%, W, L, W%, GP, TMF
+# - PT shows W/L
+# - Optional TeamAbbr from Google Sheet (fallback to ESPN Abbr)
+# - Fixed column widths (50 px)
+# - Row color coding by player + legend
+# - East+West standings
 
 import difflib
 import pandas as pd
@@ -22,6 +23,12 @@ from streamlit import column_config
 SEASON = "2025-26"  # update each year
 SHEET_ID = st.secrets["SHEET_ID"]
 DRAFT_TAB = "Draft"  # Worksheet tab in your Google Sheet
+
+# Palette for players (extend if needed)
+PLAYER_COLORS = [
+    "#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2",
+    "#F2CF5B", "#B279A2", "#FF9DA6", "#9D755D", "#BAB0AC",
+]
 
 # ----------------------------
 # Google Sheets client helpers
@@ -42,14 +49,19 @@ def ensure_draft_tab(gc):
     try:
         ws = sh.worksheet(DRAFT_TAB)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=DRAFT_TAB, rows=200, cols=3)
-        ws.update([["Player", "Team", "PointType"]])
+        ws = sh.add_worksheet(title=DRAFT_TAB, rows=200, cols=4)
+        ws.update([["Player", "Team", "PointType", "TeamAbbr"]])
     return ws
 
 def read_draft(gc) -> pd.DataFrame:
     ws = ensure_draft_tab(gc)
     rows = ws.get_all_records()
-    df = pd.DataFrame(rows, columns=["Player", "Team", "PointType"])
+    # Support optional TeamAbbr / Abbr
+    df = pd.DataFrame(rows)
+    for col in ["Player", "Team", "PointType", "TeamAbbr", "Abbr"]:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[["Player", "Team", "PointType", "TeamAbbr", "Abbr"]].rename(columns={"Abbr": "TeamAbbrSheet"})
     if not df.empty:
         df["Player"] = df["Player"].fillna("").astype(str)
         df["Team"] = df["Team"].fillna("").astype(str)
@@ -57,13 +69,17 @@ def read_draft(gc) -> pd.DataFrame:
         df["PointType"] = df["PointType"].apply(
             lambda x: "Wins" if x.strip().lower().startswith("win") else "Losses"
         )
-    return df
+        # prefer explicit TeamAbbr, then Abbr, else blank (we'll fill from ESPN later)
+        df["TeamAbbr"] = df["TeamAbbr"].replace("", pd.NA)
+        df["TeamAbbrSheet"] = df["TeamAbbrSheet"].replace("", pd.NA)
+        df["TeamAbbr"] = df["TeamAbbr"].fillna(df["TeamAbbrSheet"]).fillna("")
+    return df[["Player", "Team", "PointType", "TeamAbbr"]]
 
 def write_draft(gc, entries):
     ws = ensure_draft_tab(gc)
-    values = [["Player", "Team", "PointType"]]
+    values = [["Player", "Team", "PointType", "TeamAbbr"]]
     for e in entries:
-        values.append([e["Player"], e["Team"], e["PointType"]])
+        values.append([e.get("Player",""), e.get("Team",""), e.get("PointType",""), e.get("TeamAbbr","")])
     ws.clear()
     ws.update(values)
 
@@ -91,7 +107,7 @@ def fetch_nba_standings() -> pd.DataFrame:
     r.raise_for_status()
     data = r.json()
 
-    rows_map = {}  # team_id -> row dict (to avoid duplicates)
+    rows_map = {}  # team_id -> row dict
 
     def harvest(standings_block):
         for entry in standings_block.get("entries", []):
@@ -103,18 +119,15 @@ def fetch_nba_standings() -> pd.DataFrame:
             w = int(stats.get("wins", 0) or 0)
             l = int(stats.get("losses", 0) or 0)
             gp = w + l
-            winpct = float(stats.get("winPercent,") if "winPercent," in stats else stats.get("winPercent", 0) or (w / gp if gp else 0))
+            winpct = float(stats.get("winPercent", 0) or (w / gp if gp else 0))
             rows_map[team_id] = {"Team": name, "Abbr": abbr, "W": w, "L": l, "WinPct": winpct}
 
-    # Newer ESPN format usually has children for East/West; gather all that contain "standings"
     children = data.get("children", [])
     found_any = False
     for ch in children:
         if "standings" in ch:
             harvest(ch["standings"])
             found_any = True
-
-    # Fallback: some shapes have standings at root
     if not found_any and "standings" in data:
         harvest(data["standings"])
 
@@ -129,59 +142,97 @@ def fetch_nba_standings() -> pd.DataFrame:
     return df.sort_values("Team").reset_index(drop=True)
 
 # ----------------------------
-# Scoring + aggregation
+# Scoring + helpers
 # ----------------------------
 def safe_div(num, den, ndigits=3):
     if den == 0:
         return 0.0
     return round(num / den, ndigits)
 
+def build_player_palette(players):
+    uniq = list(dict.fromkeys(players))  # stable order
+    cmap = {p: PLAYER_COLORS[i % len(PLAYER_COLORS)] for i, p in enumerate(uniq)}
+    return cmap
+
+def style_by_player(df, player_col, cmap):
+    # Highlight whole row with player's color (light tint)
+    def _row_style(r):
+        color = cmap.get(r[player_col], "#FFFFFF")
+        # lighten color by mixing with white
+        return [f"background-color: {color}22"] * len(r)  # add 0x22 alpha
+    return df.style.apply(_row_style, axis=1)
+
+# ----------------------------
+# Calculations
+# ----------------------------
 def calc_tables(draft_df: pd.DataFrame, standings: pd.DataFrame):
     team_stats = standings.set_index("Team")[["W", "L", "WinPct"]].to_dict(orient="index")
+    abbr_map = standings.set_index("Team")["Abbr"].to_dict()
 
     rows = []
     for _, r in draft_df.iterrows():
         player = r["Player"]
         team = r["Team"]
         pt = r.get("PointType", "Wins")
+        pt_short = "W" if pt == "Wins" else "L"
         s = team_stats.get(team)
         if s is None:
             W = L = 0
+            winpct = 0.0
         else:
-            W, L = s["W"], s["L"]
+            W, L, winpct = s["W"], s["L"], s["WinPct"]
         GP = W + L
         points = W if pt == "Wins" else L
+
+        # TeamAbbr preference: sheet's TeamAbbr, else ESPN Abbr, else empty
+        tm_abbr = r.get("TeamAbbr", "").strip() or abbr_map.get(team, "")
+
         rows.append(
             {
-                "Player": player,
-                "Team": team,
-                "Point Type": pt,
-                "Points": points,
+                "PLYR": player,
+                "TM": tm_abbr,
+                "PT": pt_short,
+                "P": points,
+                "P%": safe_div(points, GP),
                 "W": W,
                 "L": L,
+                "W%": safe_div(W, GP),
                 "GP": GP,
-                "Point %": safe_div(points, GP),
-                "Win %": safe_div(W, GP),
+                "TMF": team,  # full team name (for per-team; also used to build player teams list)
             }
         )
 
     per_team_df = pd.DataFrame(rows)
-    if not per_team_df.empty:
-        per_team_df = per_team_df.sort_values(
-            ["Player", "Points", "Point %", "W"],
-            ascending=[True, False, False, False]
-        ).reset_index(drop=True)
 
+    # Player standings aggregate
     if per_team_df.empty:
-        player_table = pd.DataFrame(columns=["Player", "Points", "GP", "Point %", "Wins", "Losses", "Win %"])
+        player_table = pd.DataFrame(columns=["PLYR", "P", "GP", "P%", "W", "L", "W%", "TMF"])
     else:
         agg = (
-            per_team_df.groupby("Player", as_index=False)
-            .agg(Points=("Points", "sum"), GP=("GP", "sum"), Wins=("W", "sum"), Losses=("L", "sum"))
+            per_team_df.groupby("PLYR", as_index=False)
+            .agg(
+                P=("P", "sum"),
+                GP=("GP", "sum"),
+                W=("W", "sum"),
+                L=("L", "sum"),
+            )
         )
-        agg["Point %"] = agg.apply(lambda r: safe_div(r["Points"], r["GP"]), axis=1)
-        agg["Win %"]   = agg.apply(lambda r: safe_div(r["Wins"], r["Wins"] + r["Losses"]), axis=1)
-        player_table = agg.sort_values(["Points", "Point %", "GP"], ascending=[False, False, False]).reset_index(drop=True)
+        agg["P%"] = agg.apply(lambda r: safe_div(r["P"], r["GP"]), axis=1)
+        agg["W%"] = agg.apply(lambda r: safe_div(r["W"], r["W"] + r["L"]), axis=1)
+
+        # Add TMF = comma-separated full team names (rightmost column as requested)
+        tmf = (
+            per_team_df.groupby("PLYR")["TMF"]
+            .apply(lambda s: ", ".join(sorted([t for t in s.tolist() if t])))
+            .reset_index(name="TMF")
+        )
+        player_table = agg.merge(tmf, on="PLYR", how="left").fillna({"TMF": ""})
+
+        player_table = player_table.sort_values(["P", "P%", "GP"], ascending=[False, False, False]).reset_index(drop=True)
+
+    # Sort per-team by player then points
+    if not per_team_df.empty:
+        per_team_df = per_team_df.sort_values(["PLYR", "P", "P%", "W"], ascending=[True, False, False, False]).reset_index(drop=True)
 
     return player_table, per_team_df
 
@@ -229,7 +280,8 @@ if draft_df.empty:
     draft_df = pd.DataFrame({
         "Player": DEFAULT_PLAYERS,
         "Team": ["" for _ in DEFAULT_PLAYERS],
-        "PointType": ["Wins"] * len(DEFAULT_PLAYERS)
+        "PointType": ["Wins"] * len(DEFAULT_PLAYERS),
+        "TeamAbbr": ["" for _ in DEFAULT_PLAYERS],
     })
 
 # Mismatch detection (team names vs ESPN)
@@ -242,10 +294,9 @@ if not bad.empty:
         lambda t: ", ".join(difflib.get_close_matches(t, team_list, n=3, cutoff=0.6)) or "(no close match)"
     )
     st.warning("Some team names in your Draft sheet don’t match ESPN’s names. Fix them in the Sheet or via the editor below.")
-    st.dataframe(bad, use_container_width=True,
-                 column_config={"Team": column_config.TextColumn("Team", width=220)})
+    st.dataframe(bad, use_container_width=True)
 
-# In-app editor with dropdowns
+# In-app editor with dropdowns (keeps full names in selector; optional TeamAbbr free text)
 st.sidebar.header("Draft Editor (saves to Google Sheets)")
 team_options = sorted(team_list)
 editable_df = st.sidebar.data_editor(
@@ -254,9 +305,10 @@ editable_df = st.sidebar.data_editor(
     use_container_width=True,
     hide_index=True,
     column_config={
-        "Player": column_config.TextColumn("Player"),
-        "Team": column_config.SelectboxColumn("Team", options=[""] + team_options, required=False, width=220),
-        "PointType": column_config.SelectboxColumn("PointType", options=["Wins", "Losses"], required=True),
+        "Player": column_config.TextColumn("Player", width=50),
+        "Team": column_config.SelectboxColumn("Team (full)", options=[""] + team_options, required=False, width=200),
+        "PointType": column_config.SelectboxColumn("PointType", options=["Wins", "Losses"], required=True, width=80),
+        "TeamAbbr": column_config.TextColumn("TeamAbbr (TM)", width=80),
     }
 )
 
@@ -274,52 +326,123 @@ if st.sidebar.button("💾 Save Draft to Google Sheets"):
         bad_teams = df_clean.loc[dups, "Team"].unique().tolist()
         st.sidebar.error(f"These teams appear more than once: {', '.join(bad_teams)}")
         st.stop()
-    entries = df_clean[["Player", "Team", "PointType"]].to_dict(orient="records")
+    entries = df_clean[["Player", "Team", "PointType", "TeamAbbr"]].to_dict(orient="records")
     write_draft(gc, entries)
     st.sidebar.success("Draft saved to Google Sheets ✅")
     st.experimental_rerun()
 
 # Calculate standings
-player_table, per_team_table = calc_tables(editable_df, standings_df)
+player_table_raw, per_team_table_raw = calc_tables(editable_df, standings_df)
 
-# Player standings
+# Color map by player
+players_order = player_table_raw["PLYR"].tolist() if not player_table_raw.empty else editable_df["Player"].tolist()
+cmap = build_player_palette(players_order)
+
+def add_index(df):
+    if df.empty:
+        return df
+    df = df.copy()
+    df.insert(0, "#", range(1, len(df) + 1))
+    return df
+
+# --- Player Standings (top chart) ---
 st.divider()
 st.subheader("🏆 Player Standings (Points-Based)")
+
+# Build display table with short headers + TMF at far right
+pt_display = player_table_raw[["PLYR", "P", "P%", "W", "L", "W%", "GP", "TMF"]].copy()
+pt_display = add_index(pt_display)
+
+# Legend
+with st.container():
+    st.caption("Player colors")
+    legend_cols = st.columns(min(len(cmap), 8) or 1)
+    for i, (p, color) in enumerate(cmap.items()):
+        with legend_cols[i % len(legend_cols)]:
+            st.markdown(f"<div style='display:flex;align-items:center;gap:8px;'>"
+                        f"<span style='display:inline-block;width:14px;height:14px;background:{color};border-radius:3px;'></span>"
+                        f"<span style='font-size:0.9rem'>{p}</span></div>", unsafe_allow_html=True)
+
+# Style rows by player
+styled_pt = style_by_player(pt_display.merge(player_table_raw[["PLYR"]], left_on="PLYR", right_on="PLYR"), "PLYR", cmap)
+
 st.dataframe(
-    player_table[["Player", "Points", "GP", "Point %", "Wins", "Losses", "Win %"]],
-    use_container_width=True
+    styled_pt,
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "#": column_config.NumberColumn("#", width=50),
+        "PLYR": column_config.TextColumn("PLYR", width=50),
+        "P": column_config.NumberColumn("P", width=50),
+        "P%": column_config.NumberColumn("P%", width=50, format="%.3f"),
+        "W": column_config.NumberColumn("W", width=50),
+        "L": column_config.NumberColumn("L", width=50),
+        "W%": column_config.NumberColumn("W%", width=50, format="%.3f"),
+        "GP": column_config.NumberColumn("GP", width=50),
+        "TMF": column_config.TextColumn("TMF", width=200),  # full team names rightmost (wider for readability)
+    }
 )
 
-# Per-team breakdown (with filter) — wider "Team" column
+# --- Per-team breakdown ---
 st.divider()
 col1, col2 = st.columns([1, 3])
 with col1:
     st.subheader("Per-Team Breakdown")
-    players = ["All"] + sorted(editable_df["Player"].dropna().unique().tolist())
-    who = st.selectbox("Filter by player", players, index=0)
+    players_filter = ["All"] + sorted(editable_df["Player"].dropna().unique().tolist())
+    who = st.selectbox("Filter by player", players_filter, index=0)
 with col2:
     st.write("")
 
-if not per_team_table.empty:
-    show_df = per_team_table if who == "All" else per_team_table[per_team_table["Player"] == who]
+ptm = per_team_table_raw.copy()
+if not ptm.empty:
+    # Short headers already applied in calc; ensure order and add index
+    cols = ["PLYR", "TM", "PT", "P", "P%", "W", "L", "W%", "GP", "TMF"]
+    ptm = ptm[cols]
+    if who != "All":
+        ptm = ptm[ptm["PLYR"] == who]
+    ptm = add_index(ptm)
+
+    styled_ptm = style_by_player(ptm, "PLYR", cmap)
+
     st.dataframe(
-        show_df[["Player", "Team", "Point Type", "Points", "W", "L", "GP", "Point %", "Win %"]],
+        styled_ptm,
         use_container_width=True,
+        hide_index=True,
         column_config={
-            "Team": column_config.TextColumn("Team", width=220),
-            "Point Type": column_config.TextColumn("Point Type"),
+            "#": column_config.NumberColumn("#", width=50),
+            "PLYR": column_config.TextColumn("PLYR", width=50),
+            "TM": column_config.TextColumn("TM", width=50),
+            "PT": column_config.TextColumn("PT", width=50),
+            "P": column_config.NumberColumn("P", width=50),
+            "P%": column_config.NumberColumn("P%", width=50, format="%.3f"),
+            "W": column_config.NumberColumn("W", width=50),
+            "L": column_config.NumberColumn("L", width=50),
+            "W%": column_config.NumberColumn("W%", width=50, format="%.3f"),
+            "GP": column_config.NumberColumn("GP", width=50),
+            "TMF": column_config.TextColumn("TMF", width=200),  # keep readable on breakdown too
         }
     )
 else:
     st.info("Add draft rows (Player, Team, PointType) to your Google Sheet to see results.")
 
-# Raw standings (league-wide) — wider "Team" column
+# --- Raw standings ---
 st.divider()
 st.subheader("NBA Standings (raw, from ESPN)")
+raw = standings_df[["Team", "Abbr", "W", "L", "WinPct"]].rename(columns={"WinPct": "Win %"})
+raw = raw.copy()
+raw.insert(0, "#", range(1, len(raw) + 1))
 st.dataframe(
-    standings_df[["Team", "Abbr", "W", "L", "WinPct"]].rename(columns={"WinPct": "Win %"}),
+    raw,
     use_container_width=True,
-    column_config={"Team": column_config.TextColumn("Team", width=220)}
+    hide_index=True,
+    column_config={
+        "#": column_config.NumberColumn("#", width=50),
+        "Team": column_config.TextColumn("Team", width=200),
+        "Abbr": column_config.TextColumn("Abbr", width=50),
+        "W": column_config.NumberColumn("W", width=50),
+        "L": column_config.NumberColumn("L", width=50),
+        "Win %": column_config.NumberColumn("W%", width=50, format="%.3f"),
+    }
 )
 
 # Export Teams tab
@@ -335,8 +458,9 @@ with colB:
 st.divider()
 with st.expander("ℹ️ Notes / Tips"):
     st.markdown(f"""
-- **Google Sheet Tab:** `{DRAFT_TAB}` • **Columns:** `Player, Team, PointType` (`Wins` or `Losses`)
-- **Use exact team names** as shown in the raw standings above (or apply data validation using the exported `Teams` tab).
-- **Season:** {SEASON} • **Standings source:** ESPN (cached 15 min, combined East + West)
+- **Google Sheet Tab:** `{DRAFT_TAB}` • **Columns:** `Player, Team, PointType, TeamAbbr (optional)`
+- **TeamAbbr (TM):** If blank, app falls back to ESPN’s abbreviation.
+- **Use exact full team names** in `Team` to match ESPN (or validate via the exported `Teams` tab).
+- **Season:** {SEASON} • **Standings source:** ESPN (cached ~15 min)
 - **Guards:** Max 6 teams per player; a team can't belong to multiple players.
 """)
