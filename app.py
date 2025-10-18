@@ -5,7 +5,7 @@
 # - Column widths: PLYR=30, TM=45, others 40 (compact), TMF kept 220 for legibility
 # - Legend uses PLYR (<=6 chars) in one tight row
 # - Player table header simplified; raw standings header says "(ESPN)"
-# - East+West ESPN standings, Google Sheets persistence
+# - East+West ESPN standings, Google Sheets persistence :
 
 import difflib
 import pandas as pd
