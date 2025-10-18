@@ -176,7 +176,7 @@ def add_index(df):
 def compact_cols_config(include_tmf_width=220):
     return {
         "#":   column_config.NumberColumn("#", width=40),
-        "PLYR":column_config.TextColumn("PLYR", width=40),   # was 30
+        "PLYR":column_config.TextColumn("PLYR", width=55),   # was 30
         "TM":  column_config.TextColumn("TM", width=45),
         "PT":  column_config.TextColumn("PT", width=30),     # was 40
         "P":   column_config.NumberColumn("P", width=30),    # was 40
