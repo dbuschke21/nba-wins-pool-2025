@@ -243,7 +243,7 @@ if not bad.empty:
     )
     st.warning("Some team names in your Draft sheet don’t match ESPN’s names. Fix them in the Sheet or via the editor below.")
     st.dataframe(bad, use_container_width=True,
-                 column_config={"Team": column_config.TextColumn("Team", width="large")})
+                 column_config={"Team": column_config.TextColumn("Team", width=220)})
 
 # In-app editor with dropdowns
 st.sidebar.header("Draft Editor (saves to Google Sheets)")
@@ -255,7 +255,7 @@ editable_df = st.sidebar.data_editor(
     hide_index=True,
     column_config={
         "Player": column_config.TextColumn("Player"),
-        "Team": column_config.SelectboxColumn("Team", options=[""] + team_options, required=False, width="large"),
+        "Team": column_config.SelectboxColumn("Team", options=[""] + team_options, required=False, width=220),
         "PointType": column_config.SelectboxColumn("PointType", options=["Wins", "Losses"], required=True),
     }
 )
@@ -306,7 +306,7 @@ if not per_team_table.empty:
         show_df[["Player", "Team", "Point Type", "Points", "W", "L", "GP", "Point %", "Win %"]],
         use_container_width=True,
         column_config={
-            "Team": column_config.TextColumn("Team", width="large"),
+            "Team": column_config.TextColumn("Team", width=220),
             "Point Type": column_config.TextColumn("Point Type"),
         }
     )
@@ -319,7 +319,7 @@ st.subheader("NBA Standings (raw, from ESPN)")
 st.dataframe(
     standings_df[["Team", "Abbr", "W", "L", "WinPct"]].rename(columns={"WinPct": "Win %"}),
     use_container_width=True,
-    column_config={"Team": column_config.TextColumn("Team", width="large")}
+    column_config={"Team": column_config.TextColumn("Team", width=220)}
 )
 
 # Export Teams tab
