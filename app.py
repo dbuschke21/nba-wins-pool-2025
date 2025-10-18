@@ -173,20 +173,19 @@ def add_index(df):
     df = df.copy()
     df.insert(0, "#", range(1, len(df) + 1))
     return df
-
 def compact_cols_config(include_tmf_width=220):
     return {
         "#":   column_config.NumberColumn("#", width=40),
-        "PLYR":column_config.TextColumn("PLYR", width=30),
+        "PLYR":column_config.TextColumn("PLYR", width=40),   # was 30
         "TM":  column_config.TextColumn("TM", width=45),
-        "PT":  column_config.TextColumn("PT", width=40),
-        "P":   column_config.NumberColumn("P", width=40),
+        "PT":  column_config.TextColumn("PT", width=30),     # was 40
+        "P":   column_config.NumberColumn("P", width=30),    # was 40
         "P%":  column_config.NumberColumn("P%", width=40, format="%.1f"),
-        "W":   column_config.NumberColumn("W", width=40),
-        "L":   column_config.NumberColumn("L", width=40),
+        "W":   column_config.NumberColumn("W", width=30),    # was 40
+        "L":   column_config.NumberColumn("L", width=30),    # was 40
         "W%":  column_config.NumberColumn("W%", width=40, format="%.1f"),
         "GP":  column_config.NumberColumn("GP", width=40),
-        "TMF": column_config.TextColumn("TMF", width=include_tmf_width),
+        "TMF": column_config.TextColumn("TMF", width=220),
     }
 
 # ----------------------------
