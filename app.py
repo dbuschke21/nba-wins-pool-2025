@@ -1,13 +1,11 @@
 # app.py — NBA Wins/Losses Pool Tracker (Google Sheets + ESPN)
 # ------------------------------------------------------------
 # This build:
-# - Reads PLYR (<=6 chars) from Sheet; uses for colors & display
-# - Horizontal, tight legend using PLYR
-# - % columns = one decimal (e.g., 56.7)
-# - Compact columns width=40 (digits / PT / abbr / index)
-# - Short headers: PLYR, TM, PT, P, P%, W, L, W%, GP, TMF
-# - PT shows W/L; optional TeamAbbr from Sheet
-# - East+West ESPN standings
+# - % values: one decimal (e.g., 56.7); no % symbol in values (only in headers P%, W%)
+# - Column widths: PLYR=30, TM=45, others 40 (compact), TMF kept 220 for legibility
+# - Legend uses PLYR (<=6 chars) in one tight row
+# - Player table header simplified; raw standings header says "(ESPN)"
+# - East+West ESPN standings, Google Sheets persistence
 
 import difflib
 import pandas as pd
@@ -75,7 +73,7 @@ def read_draft(gc) -> pd.DataFrame:
     df["Abbr"] = df["Abbr"].replace("", pd.NA)
     df["TeamAbbr"] = df["TeamAbbr"].fillna(df["Abbr"]).fillna("")
 
-    # Clip PLYR to 6 chars just in case (display-only)
+    # Clip PLYR to 6 chars (display)
     df["PLYR"] = df["PLYR"].apply(lambda s: s[:6])
 
     return df[["Player", "PLYR", "Team", "PointType", "TeamAbbr"]]
@@ -150,12 +148,11 @@ def fetch_nba_standings() -> pd.DataFrame:
     return df.sort_values("Team").reset_index(drop=True)
 
 # ----------------------------
-# Scoring + helpers
+# Helpers
 # ----------------------------
 def build_player_palette(plyrs):
-    uniq = [p for p in plyrs if p]  # skip blanks
-    seen = set()
-    ordered = []
+    uniq = [p for p in plyrs if p]
+    seen, ordered = set(), []
     for p in uniq:
         if p not in seen:
             seen.add(p); ordered.append(p)
@@ -165,7 +162,10 @@ def style_by_plyr(df, plyr_col, cmap):
     def _row_style(r):
         color = cmap.get(r[plyr_col], "#FFFFFF")
         return [f"background-color: {color}22"] * len(r)
-    return df.style.apply(_row_style, axis=1)
+    styler = df.style.apply(_row_style, axis=1)
+    # Ensure numeric formatting (prevents any weird "000000" artifacts)
+    fmt = {"P%": "{:.1f}", "W%": "{:.1f}"}
+    return styler.format(fmt)
 
 def add_index(df):
     if df.empty:
@@ -173,6 +173,21 @@ def add_index(df):
     df = df.copy()
     df.insert(0, "#", range(1, len(df) + 1))
     return df
+
+def compact_cols_config(include_tmf_width=220):
+    return {
+        "#":   column_config.NumberColumn("#", width=40),
+        "PLYR":column_config.TextColumn("PLYR", width=30),
+        "TM":  column_config.TextColumn("TM", width=45),
+        "PT":  column_config.TextColumn("PT", width=40),
+        "P":   column_config.NumberColumn("P", width=40),
+        "P%":  column_config.NumberColumn("P%", width=40, format="%.1f"),
+        "W":   column_config.NumberColumn("W", width=40),
+        "L":   column_config.NumberColumn("L", width=40),
+        "W%":  column_config.NumberColumn("W%", width=40, format="%.1f"),
+        "GP":  column_config.NumberColumn("GP", width=40),
+        "TMF": column_config.TextColumn("TMF", width=include_tmf_width),
+    }
 
 # ----------------------------
 # Calculations
@@ -195,21 +210,20 @@ def calc_tables(draft_df: pd.DataFrame, standings: pd.DataFrame):
             W, L = s["W"], s["L"]
         GP = W + L
         points = W if pt == "Wins" else L
-
         tm_abbr = r.get("TeamAbbr", "").strip() or abbr_map.get(team, "")
 
         rows.append(
             {
                 "PLYR": plyr,
-                "P_FULL": player,  # keep full name for legend hover if needed
+                "P_FULL": player,  # keep full for refs if needed
                 "TM": tm_abbr,
                 "PT": pt_short,
-                "P": points,
-                "P%": round((points / GP) * 100, 1) if GP else 0.0,  # 0..100 with one decimal
-                "W": W,
-                "L": L,
+                "P": int(points),
+                "P%": round((points / GP) * 100, 1) if GP else 0.0,  # values like 56.7 (no % sign)
+                "W": int(W),
+                "L": int(L),
                 "W%": round((W / GP) * 100, 1) if GP else 0.0,
-                "GP": GP,
+                "GP": int(GP),
                 "TMF": team,  # full team name
             }
         )
@@ -226,7 +240,6 @@ def calc_tables(draft_df: pd.DataFrame, standings: pd.DataFrame):
         agg["P%"] = round((agg["P"] / agg["GP"].replace(0, pd.NA)) * 100, 1).fillna(0.0)
         agg["W%"] = round((agg["W"] / (agg["W"] + agg["L"]).replace(0, pd.NA)) * 100, 1).fillna(0.0)
 
-        # TMF list per PLYR (from full team names)
         tmf = (
             per_team_df.groupby("PLYR")["TMF"]
             .apply(lambda s: ", ".join(sorted([t for t in s.tolist() if t])))
@@ -244,7 +257,7 @@ def calc_tables(draft_df: pd.DataFrame, standings: pd.DataFrame):
 # UI
 # ----------------------------
 st.set_page_config(page_title="NBA Draft Tracker", page_icon="🏀", layout="wide")
-st.title("🏀 NBA Wins/Losses Pool Tracker (Google Sheets + ESPN Live Data)")
+st.title("🏀 NBA Wins/Losses Pool Tracker")
 st.caption(
     "Draft data is stored in your **Google Sheet** (tab 'Draft'). "
     "Each team earns points based on its 'PointType': 1 per Win or 1 per Loss. "
@@ -318,18 +331,15 @@ editable_df = st.sidebar.data_editor(
 if st.sidebar.button("💾 Save Draft to Google Sheets"):
     df_clean = editable_df.copy().fillna("")
     df_clean = df_clean[df_clean["Team"] != ""]
-    # PLYR length check
     too_long = df_clean[df_clean["PLYR"].str.len() > 6]
     if not too_long.empty:
         st.sidebar.error("Some PLYR values exceed 6 chars. Please shorten them.")
         st.stop()
-    # limit 6 per Player (full name)
     counts = df_clean.groupby("Player").size()
     offenders = [p for p, n in counts.items() if n > 6]
     if offenders:
         st.sidebar.error(f"Each player can have up to 6 teams. Offending: {', '.join(offenders)}")
         st.stop()
-    # unique Team
     dups = df_clean.duplicated(subset=["Team"], keep=False)
     if dups.any():
         bad_teams = df_clean.loc[dups, "Team"].unique().tolist()
@@ -360,24 +370,9 @@ if cmap:
     st.caption("Player colors")
     st.markdown(legend_html, unsafe_allow_html=True)
 
-def compact_cols_config(include_tmf_width=220):
-    return {
-        "#":   column_config.NumberColumn("#", width=40),
-        "PLYR":column_config.TextColumn("PLYR", width=80),
-        "TM":  column_config.TextColumn("TM", width=40),
-        "PT":  column_config.TextColumn("PT", width=40),
-        "P":   column_config.NumberColumn("P", width=40),
-        "P%":  column_config.NumberColumn("P%", width=40, format="%.1f"),
-        "W":   column_config.NumberColumn("W", width=40),
-        "L":   column_config.NumberColumn("L", width=40),
-        "W%":  column_config.NumberColumn("W%", width=40, format="%.1f"),
-        "GP":  column_config.NumberColumn("GP", width=40),
-        "TMF": column_config.TextColumn("TMF", width=include_tmf_width),
-    }
-
 # ---- Player Standings ----
 st.divider()
-st.subheader("🏆 Player Standings (Points-Based)")
+st.subheader("🏆 Player Standings")
 pt_display = player_table_raw[["PLYR", "P", "P%", "W", "L", "W%", "GP", "TMF"]].copy()
 pt_display = add_index(pt_display)
 styled_pt = style_by_plyr(pt_display, "PLYR", cmap)
@@ -404,13 +399,13 @@ if not ptm.empty:
     cols = ["PLYR", "TM", "PT", "P", "P%", "W", "L", "W%", "GP", "TMF"]
     ptm = ptm[cols]
     if who != "All":
-        # filter by full Player name, but display PLYR in table
+        # map full Player -> PLYR
         full_to_plyr = editable_df.set_index("Player")["PLYR"].to_dict()
         sel_plyr = full_to_plyr.get(who, None)
         if sel_plyr:
             ptm = ptm[ptm["PLYR"] == sel_plyr]
         else:
-            ptm = ptm.iloc[0:0]  # empty
+            ptm = ptm.iloc[0:0]
 
     ptm = add_index(ptm)
     styled_ptm = style_by_plyr(ptm, "PLYR", cmap)
@@ -426,7 +421,7 @@ else:
 
 # ---- Raw standings ----
 st.divider()
-st.subheader("NBA Standings (raw, from ESPN)")
+st.subheader("NBA Standings (ESPN)")
 raw = standings_df[["Team", "Abbr", "W", "L", "WinPct"]].rename(columns={"WinPct": "W%"})
 raw["W%"] = (raw["W%"] * 100).round(1)
 raw = raw.copy()
@@ -438,7 +433,7 @@ st.dataframe(
     column_config={
         "#":   column_config.NumberColumn("#", width=40),
         "Team":column_config.TextColumn("Team", width=220),
-        "Abbr":column_config.TextColumn("Abbr", width=40),
+        "Abbr":column_config.TextColumn("Abbr", width=45),
         "W":   column_config.NumberColumn("W", width=40),
         "L":   column_config.NumberColumn("L", width=40),
         "W%":  column_config.NumberColumn("W%", width=40, format="%.1f"),
