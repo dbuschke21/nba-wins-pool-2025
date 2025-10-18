@@ -1,11 +1,12 @@
 # app.py — NBA Wins/Losses Pool Tracker (Google Sheets + ESPN)
 # ------------------------------------------------------------
 # This build:
-# - % values: one decimal (e.g., 56.7); no % symbol in values (only in headers P%, W%)
-# - Column widths: PLYR=30, TM=45, others 40 (compact), TMF kept 220 for legibility
+# - Default sort: Player Standings & Per-Team by P% desc; NBA Standings alphabetical
+# - TMF (top table) = comma-separated team abbreviations (TM)
+# - % values = one decimal (e.g., 56.7), no % symbol in values (only in headers P%, W%)
+# - Column widths: PLYR=40, TM=45, PT/P/W/L=30, others 40; TMF kept 220 for legibility
 # - Legend uses PLYR (<=6 chars) in one tight row
-# - Player table header simplified; raw standings header says "(ESPN)"
-# - East+West ESPN standings, Google Sheets persistence :
+# - East+West ESPN standings, Google Sheets persistence
 
 import difflib
 import pandas as pd
@@ -145,6 +146,7 @@ def fetch_nba_standings() -> pd.DataFrame:
     df["W"] = df["W"].astype(int)
     df["L"] = df["L"].astype(int)
     df["WinPct"] = df["WinPct"].astype(float)
+    # Keep alphabetical default
     return df.sort_values("Team").reset_index(drop=True)
 
 # ----------------------------
@@ -163,7 +165,7 @@ def style_by_plyr(df, plyr_col, cmap):
         color = cmap.get(r[plyr_col], "#FFFFFF")
         return [f"background-color: {color}22"] * len(r)
     styler = df.style.apply(_row_style, axis=1)
-    # Ensure numeric formatting (prevents any weird "000000" artifacts)
+    # Force numeric formatting for % columns
     fmt = {"P%": "{:.1f}", "W%": "{:.1f}"}
     return styler.format(fmt)
 
@@ -173,19 +175,20 @@ def add_index(df):
     df = df.copy()
     df.insert(0, "#", range(1, len(df) + 1))
     return df
+
 def compact_cols_config(include_tmf_width=220):
     return {
         "#":   column_config.NumberColumn("#", width=40),
-        "PLYR":column_config.TextColumn("PLYR", width=55),   # was 30
+        "PLYR":column_config.TextColumn("PLYR", width=40),
         "TM":  column_config.TextColumn("TM", width=45),
-        "PT":  column_config.TextColumn("PT", width=30),     # was 40
-        "P":   column_config.NumberColumn("P", width=30),    # was 40
+        "PT":  column_config.TextColumn("PT", width=30),
+        "P":   column_config.NumberColumn("P", width=30),
         "P%":  column_config.NumberColumn("P%", width=40, format="%.1f"),
-        "W":   column_config.NumberColumn("W", width=30),    # was 40
-        "L":   column_config.NumberColumn("L", width=30),    # was 40
+        "W":   column_config.NumberColumn("W", width=30),
+        "L":   column_config.NumberColumn("L", width=30),
         "W%":  column_config.NumberColumn("W%", width=40, format="%.1f"),
         "GP":  column_config.NumberColumn("GP", width=40),
-        "TMF": column_config.TextColumn("TMF", width=220),
+        "TMF": column_config.TextColumn("TMF", width=include_tmf_width),
     }
 
 # ----------------------------
@@ -223,7 +226,7 @@ def calc_tables(draft_df: pd.DataFrame, standings: pd.DataFrame):
                 "L": int(L),
                 "W%": round((W / GP) * 100, 1) if GP else 0.0,
                 "GP": int(GP),
-                "TMF": team,  # full team name
+                "TMF": team,  # full team name (not used in top table now; see display build)
             }
         )
 
@@ -239,16 +242,20 @@ def calc_tables(draft_df: pd.DataFrame, standings: pd.DataFrame):
         agg["P%"] = round((agg["P"] / agg["GP"].replace(0, pd.NA)) * 100, 1).fillna(0.0)
         agg["W%"] = round((agg["W"] / (agg["W"] + agg["L"]).replace(0, pd.NA)) * 100, 1).fillna(0.0)
 
-        tmf = (
-            per_team_df.groupby("PLYR")["TMF"]
-            .apply(lambda s: ", ".join(sorted([t for t in s.tolist() if t])))
+        # TMF for top table = comma-separated abbreviations (TM)
+        tm_list = (
+            per_team_df.groupby("PLYR")["TM"]
+            .apply(lambda s: ", ".join([t for t in s.tolist() if t]))  # TM abbreviations joined
             .reset_index(name="TMF")
         )
-        player_table = agg.merge(tmf, on="PLYR", how="left").fillna({"TMF": ""})
-        player_table = player_table.sort_values(["P", "P%", "GP"], ascending=[False, False, False]).reset_index(drop=True)
+        player_table = agg.merge(tm_list, on="PLYR", how="left").fillna({"TMF": ""})
 
+        # Default sort by P% desc (then P, then GP)
+        player_table = player_table.sort_values(["P%", "P", "GP"], ascending=[False, False, False]).reset_index(drop=True)
+
+    # For per-team default sort by P% desc (then P, then W)
     if not per_team_df.empty:
-        per_team_df = per_team_df.sort_values(["PLYR", "P", "P%", "W"], ascending=[True, False, False, False]).reset_index(drop=True)
+        per_team_df = per_team_df.sort_values(["P%", "P", "W"], ascending=[False, False, False]).reset_index(drop=True)
 
     return player_table, per_team_df
 
@@ -349,10 +356,10 @@ if st.sidebar.button("💾 Save Draft to Google Sheets"):
     st.sidebar.success("Draft saved to Google Sheets ✅")
     st.experimental_rerun()
 
-# Calculate
+# Calculate (includes default sorting by P% desc inside)
 player_table_raw, per_team_table_raw = calc_tables(editable_df, standings_df)
 
-# Colors (ordered by PLYR in the standings table to keep legend stable)
+# Colors (ordered by PLYR to keep legend stable)
 plyr_order = player_table_raw["PLYR"].tolist() if not player_table_raw.empty else editable_df["PLYR"].tolist()
 cmap = build_player_palette(plyr_order)
 
@@ -369,21 +376,19 @@ if cmap:
     st.caption("Player colors")
     st.markdown(legend_html, unsafe_allow_html=True)
 
-# ---- Player Standings ----
+def display_with_index(df, col_cfg):
+    df = add_index(df)
+    styled = style_by_plyr(df, "PLYR", cmap) if "PLYR" in df.columns else df
+    st.dataframe(styled, use_container_width=True, hide_index=True, column_config=col_cfg)
+
+# ---- Player Standings (sorted by P% desc) ----
 st.divider()
 st.subheader("🏆 Player Standings")
 pt_display = player_table_raw[["PLYR", "P", "P%", "W", "L", "W%", "GP", "TMF"]].copy()
-pt_display = add_index(pt_display)
-styled_pt = style_by_plyr(pt_display, "PLYR", cmap)
+# Already sorted by P% desc in calc_tables; show as-is
+display_with_index(pt_display, compact_cols_config(include_tmf_width=220))
 
-st.dataframe(
-    styled_pt,
-    use_container_width=True,
-    hide_index=True,
-    column_config=compact_cols_config(include_tmf_width=220),
-)
-
-# ---- Per-team breakdown ----
+# ---- Per-team breakdown (sorted by P% desc) ----
 st.divider()
 col1, col2 = st.columns([1, 3])
 with col1:
@@ -406,19 +411,12 @@ if not ptm.empty:
         else:
             ptm = ptm.iloc[0:0]
 
-    ptm = add_index(ptm)
-    styled_ptm = style_by_plyr(ptm, "PLYR", cmap)
-
-    st.dataframe(
-        styled_ptm,
-        use_container_width=True,
-        hide_index=True,
-        column_config=compact_cols_config(include_tmf_width=220),
-    )
+    # Already sorted by P% desc in calc_tables; show as-is
+    display_with_index(ptm, compact_cols_config(include_tmf_width=220))
 else:
     st.info("Add draft rows (Player, PLYR, Team, PointType) to your Google Sheet to see results.")
 
-# ---- Raw standings ----
+# ---- Raw standings (alphabetical) ----
 st.divider()
 st.subheader("NBA Standings (ESPN)")
 raw = standings_df[["Team", "Abbr", "W", "L", "WinPct"]].rename(columns={"WinPct": "W%"})
@@ -453,7 +451,7 @@ st.divider()
 with st.expander("ℹ️ Notes / Tips"):
     st.markdown(f"""
 - **Google Sheet Tab:** `{DRAFT_TAB}` • **Columns:** `Player, PLYR (<=6), Team, PointType, TeamAbbr (optional)`
-- **TeamAbbr (TM):** If blank, app falls back to ESPN’s abbreviation.
+- **TMF (top table):** comma-separated team abbreviations (from TM).
 - **Use exact full team names** in `Team` to match ESPN (or validate via the exported `Teams` tab).
 - **Season:** {SEASON} • **Standings source:** ESPN (cached ~15 min)
 - **Guards:** Max 6 teams per player; a team can't belong to multiple players.
