@@ -1,13 +1,15 @@
 # app.py — NBA Wins/Losses Pool Tracker (Google Sheets + ESPN)
 # ------------------------------------------------------------
-# This build:
-# - Default sort: Player Standings & Per-Team by P% desc; NBA Standings alphabetical
-# - TMF (top table) = comma-separated team abbreviations (TM)
-# - % values = one decimal (e.g., 56.7), no % symbol in values (only in headers P%, W%)
-# - Column widths: PLYR=40, TM=45, PT/P/W/L=30, others 40; TMF kept 220 for legibility
-# - Legend uses PLYR (<=6 chars) in one tight row
-# - East+West ESPN standings, Google Sheets persistence
+# Updates in this build:
+# - "Hard refresh (no cache)" button to fully bypass Streamlit cache for ESPN
+# - Stricter team normalization from Google Sheet (strip/condense spaces)
+# - Diagnostics panel (counts + mismatch table with suggestions)
+# - More robust ESPN parser: scans children + root standings fallback
+# - Default sort: Player & Per-Team by P% desc; NBA standings alphabetical
+# - Short headers, compact widths, 1-decimal percentages (no % in values)
+# - PLYR (<=6) used for colors & legend; TMF shows comma-separated TM abbreviations
 
+import re
 import difflib
 import pandas as pd
 import requests
@@ -52,30 +54,34 @@ def ensure_draft_tab(gc):
         ws.update([["Player", "PLYR", "Team", "PointType", "TeamAbbr"]])
     return ws
 
+def normalize_team_name(s: str) -> str:
+    """Trim and condense internal whitespace so 'Los  Angeles  Lakers' -> 'Los Angeles Lakers'."""
+    s = (s or "").strip()
+    s = re.sub(r"\s{2,}", " ", s)
+    return s
+
 def read_draft(gc) -> pd.DataFrame:
     ws = ensure_draft_tab(gc)
     rows = ws.get_all_records()
     df = pd.DataFrame(rows)
 
-    # Ensure all columns exist
+    # Ensure columns exist
     for col in ["Player", "PLYR", "Team", "PointType", "TeamAbbr", "Abbr"]:
         if col not in df.columns:
             df[col] = ""
 
     # Normalize
     df["Player"] = df["Player"].fillna("").astype(str)
-    df["PLYR"]   = df["PLYR"].fillna("").astype(str)
-    df["Team"]   = df["Team"].fillna("").astype(str)
+    df["PLYR"]   = df["PLYR"].fillna("").astype(str).apply(lambda s: s[:6])
+    df["Team"]   = df["Team"].fillna("").astype(str).apply(normalize_team_name)
     df["PointType"] = (
         df["PointType"].fillna("Wins").astype(str).apply(lambda x: "Wins" if x.strip().lower().startswith("win") else "Losses")
     )
 
+    # Prefer explicit TeamAbbr, else legacy Abbr, else blank (will fallback to ESPN later)
     df["TeamAbbr"] = df["TeamAbbr"].replace("", pd.NA)
     df["Abbr"] = df["Abbr"].replace("", pd.NA)
     df["TeamAbbr"] = df["TeamAbbr"].fillna(df["Abbr"]).fillna("")
-
-    # Clip PLYR to 6 chars (display)
-    df["PLYR"] = df["PLYR"].apply(lambda s: s[:6])
 
     return df[["Player", "PLYR", "Team", "PointType", "TeamAbbr"]]
 
@@ -86,7 +92,7 @@ def write_draft(gc, entries):
         values.append([
             e.get("Player",""),
             (e.get("PLYR","") or "")[:6],
-            e.get("Team",""),
+            normalize_team_name(e.get("Team","")),
             e.get("PointType",""),
             e.get("TeamAbbr",""),
         ])
@@ -106,15 +112,18 @@ def export_teams_tab(gc, sheet_id, teams):
 # ----------------------------
 # ESPN Standings fetch (East + West)
 # ----------------------------
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=900, show_spinner=False)
 def fetch_nba_standings() -> pd.DataFrame:
-    """Returns DataFrame with columns: Team, Abbr, W, L, WinPct (0..1)."""
+    """
+    Returns DataFrame with columns: Team, Abbr, W, L, WinPct (0..1).
+    Robust parser: scans children (East/West) and root standings.
+    """
     url = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/standings"
     r = requests.get(url, timeout=20)
     r.raise_for_status()
     data = r.json()
 
-    rows_map = {}
+    rows_map = {}  # team_id -> dict
 
     def harvest(standings_block):
         for entry in standings_block.get("entries", []):
@@ -122,19 +131,23 @@ def fetch_nba_standings() -> pd.DataFrame:
             team_id = team.get("id") or team.get("uid") or (team.get("displayName") or team.get("name"))
             name = team.get("displayName") or team.get("name")
             abbr = team.get("abbreviation") or team.get("shortDisplayName")
-            stats = {s.get("id"): s.get("value") for s in entry.get("stats", []) if "id" in s}
+            stats_list = entry.get("stats", []) or []
+            stats = {s.get("id"): s.get("value") for s in stats_list if isinstance(s, dict) and "id" in s}
             w = int(stats.get("wins", 0) or 0)
             l = int(stats.get("losses", 0) or 0)
             gp = w + l
             winpct = float(stats.get("winPercent", 0) or (w / gp if gp else 0))
             rows_map[team_id] = {"Team": name, "Abbr": abbr, "W": w, "L": l, "WinPct": winpct}
 
+    # Try children blocks (usual East/West)
     children = data.get("children", [])
     found_any = False
     for ch in children:
-        if "standings" in ch:
+        if isinstance(ch, dict) and "standings" in ch:
             harvest(ch["standings"])
             found_any = True
+
+    # Fallback: standings at root
     if not found_any and "standings" in data:
         harvest(data["standings"])
 
@@ -146,7 +159,7 @@ def fetch_nba_standings() -> pd.DataFrame:
     df["W"] = df["W"].astype(int)
     df["L"] = df["L"].astype(int)
     df["WinPct"] = df["WinPct"].astype(float)
-    # Keep alphabetical default
+    # Keep alphabetical default for the raw standings table
     return df.sort_values("Team").reset_index(drop=True)
 
 # ----------------------------
@@ -165,7 +178,7 @@ def style_by_plyr(df, plyr_col, cmap):
         color = cmap.get(r[plyr_col], "#FFFFFF")
         return [f"background-color: {color}22"] * len(r)
     styler = df.style.apply(_row_style, axis=1)
-    # Force numeric formatting for % columns
+    # Explicit numeric formatting for % columns
     fmt = {"P%": "{:.1f}", "W%": "{:.1f}"}
     return styler.format(fmt)
 
@@ -195,38 +208,43 @@ def compact_cols_config(include_tmf_width=220):
 # Calculations
 # ----------------------------
 def calc_tables(draft_df: pd.DataFrame, standings: pd.DataFrame):
-    team_stats = standings.set_index("Team")[["W", "L", "WinPct"]].to_dict(orient="index")
-    abbr_map = standings.set_index("Team")["Abbr"].to_dict()
+    # Build lookup dicts
+    standings["TeamNorm"] = standings["Team"].apply(normalize_team_name)
+    team_stats = standings.set_index("TeamNorm")[["W", "L", "WinPct"]].to_dict(orient="index")
+    abbr_map   = standings.set_index("TeamNorm")["Abbr"].to_dict()
 
     rows = []
     for _, r in draft_df.iterrows():
         player = r["Player"]
         plyr   = r["PLYR"] or (player[:6] if player else "")
         team   = r["Team"]
+        team_key = normalize_team_name(team)
         pt     = r.get("PointType", "Wins")
         pt_short = "W" if pt == "Wins" else "L"
-        s = team_stats.get(team)
+
+        s = team_stats.get(team_key)
         if s is None:
             W = L = 0
         else:
             W, L = s["W"], s["L"]
+
         GP = W + L
         points = W if pt == "Wins" else L
-        tm_abbr = r.get("TeamAbbr", "").strip() or abbr_map.get(team, "")
+        tm_abbr = (r.get("TeamAbbr", "") or "").strip() or abbr_map.get(team_key, "")
 
         rows.append(
             {
                 "PLYR": plyr,
-                "P_FULL": player,  # keep full for refs if needed
+                "P_FULL": player,
                 "TM": tm_abbr,
                 "PT": pt_short,
                 "P": int(points),
-                "P%": round((points / GP) * 100, 1) if GP else 0.0,  # values like 56.7 (no % sign)
+                "P%": round((points / GP) * 100, 1) if GP else 0.0,
                 "W": int(W),
                 "L": int(L),
                 "W%": round((W / GP) * 100, 1) if GP else 0.0,
                 "GP": int(GP),
-                "TMF": team,  # full team name (not used in top table now; see display build)
+                "TMF": team,  # full team name (input)
             }
         )
 
@@ -245,7 +263,7 @@ def calc_tables(draft_df: pd.DataFrame, standings: pd.DataFrame):
         # TMF for top table = comma-separated abbreviations (TM)
         tm_list = (
             per_team_df.groupby("PLYR")["TM"]
-            .apply(lambda s: ", ".join([t for t in s.tolist() if t]))  # TM abbreviations joined
+            .apply(lambda s: ", ".join([t for t in s.tolist() if t]))
             .reset_index(name="TMF")
         )
         player_table = agg.merge(tm_list, on="PLYR", how="left").fillna({"TMF": ""})
@@ -253,7 +271,7 @@ def calc_tables(draft_df: pd.DataFrame, standings: pd.DataFrame):
         # Default sort by P% desc (then P, then GP)
         player_table = player_table.sort_values(["P%", "P", "GP"], ascending=[False, False, False]).reset_index(drop=True)
 
-    # For per-team default sort by P% desc (then P, then W)
+    # Per-team default sort by P% desc (then P, then W)
     if not per_team_df.empty:
         per_team_df = per_team_df.sort_values(["P%", "P", "W"], ascending=[False, False, False]).reset_index(drop=True)
 
@@ -270,7 +288,14 @@ st.caption(
     "Standings update live from ESPN."
 )
 
-# Fetch standings
+# Fetch standings (with a true no-cache path)
+colR, colBlank = st.columns([1, 9])
+with colR:
+    if st.button("🔧 Hard refresh (no cache)"):
+        fetch_nba_standings.clear()
+        st.experimental_rerun()
+
+# Normal (cached) fetch
 try:
     standings_df = fetch_nba_standings()
     team_list = standings_df["Team"].tolist()
@@ -279,7 +304,7 @@ except Exception as e:
     st.error(f"❌ Could not load standings: {e}")
     st.stop()
 
-# Sidebar: refresh
+# Sidebar: regular refresh
 with st.sidebar:
     if st.button("🔄 Refresh data (clear cache)"):
         fetch_nba_standings.clear()
@@ -298,23 +323,31 @@ except Exception as e:
     )
     st.stop()
 
-DEFAULT_PLAYERS = ["Alice", "Bob", "Charlie", "Dana", "Evan"]
-if draft_df.empty:
-    draft_df = pd.DataFrame({
-        "Player": DEFAULT_PLAYERS,
-        "PLYR": [p[:6] for p in DEFAULT_PLAYERS],
-        "Team": ["" for _ in DEFAULT_PLAYERS],
-        "PointType": ["Wins"] * len(DEFAULT_PLAYERS),
-        "TeamAbbr": ["" for _ in DEFAULT_PLAYERS],
-    })
+# Diagnostics: counts + mismatches
+diag_cols = st.columns([1,1,1,5])
+with diag_cols[0]:
+    st.metric("Draft rows", len(draft_df))
+with diag_cols[1]:
+    st.metric("ESPN teams", len(standings_df))
+with diag_cols[2]:
+    # how many match
+    espn_set = set(standings_df["Team"].apply(normalize_team_name))
+    typed = draft_df["Team"].apply(normalize_team_name)
+    st.metric("Teams matched", int((typed.isin(espn_set)) & (typed != "")).sum())
 
-# Mismatch detection
+# Mismatch table with suggestions
 team_set = set(team_list)
-bad = draft_df[(draft_df["Team"].fillna("") != "") & (~draft_df["Team"].isin(team_set))][["Player", "Team"]].copy()
+bad = draft_df[(draft_df["Team"].fillna("") != "") & (~draft_df["Team"].apply(normalize_team_name).isin(
+    set(standings_df["Team"].apply(normalize_team_name))
+))][["Player", "PLYR", "Team"]].copy()
+
 if not bad.empty:
-    bad["Suggestions"] = bad["Team"].apply(lambda t: ", ".join(difflib.get_close_matches(t, team_list, n=3, cutoff=0.6)) or "(no close match)")
-    st.warning("Some team names in your Draft sheet don’t match ESPN’s names. Fix them in the Sheet or via the editor below.")
-    st.dataframe(bad, use_container_width=True)
+    bad["Suggestions"] = bad["Team"].apply(
+        lambda t: ", ".join(difflib.get_close_matches(normalize_team_name(t), list(standings_df["Team"]), n=3, cutoff=0.6)) or "(no close match)"
+    )
+    with diag_cols[3]:
+        st.warning("Some team names in your Draft sheet don’t match ESPN’s names. Fix them in the Sheet or via the editor.")
+        st.dataframe(bad, use_container_width=True)
 
 # Editor (includes PLYR)
 st.sidebar.header("Draft Editor (saves to Google Sheets)")
@@ -336,6 +369,7 @@ editable_df = st.sidebar.data_editor(
 # Save guards (max 6 per player, unique team, PLYR <= 6 chars)
 if st.sidebar.button("💾 Save Draft to Google Sheets"):
     df_clean = editable_df.copy().fillna("")
+    df_clean["Team"] = df_clean["Team"].apply(normalize_team_name)
     df_clean = df_clean[df_clean["Team"] != ""]
     too_long = df_clean[df_clean["PLYR"].str.len() > 6]
     if not too_long.empty:
@@ -356,7 +390,7 @@ if st.sidebar.button("💾 Save Draft to Google Sheets"):
     st.sidebar.success("Draft saved to Google Sheets ✅")
     st.experimental_rerun()
 
-# Calculate (includes default sorting by P% desc inside)
+# Calculate (sorted by P% desc inside)
 player_table_raw, per_team_table_raw = calc_tables(editable_df, standings_df)
 
 # Colors (ordered by PLYR to keep legend stable)
@@ -385,7 +419,6 @@ def display_with_index(df, col_cfg):
 st.divider()
 st.subheader("🏆 Player Standings")
 pt_display = player_table_raw[["PLYR", "P", "P%", "W", "L", "W%", "GP", "TMF"]].copy()
-# Already sorted by P% desc in calc_tables; show as-is
 display_with_index(pt_display, compact_cols_config(include_tmf_width=220))
 
 # ---- Per-team breakdown (sorted by P% desc) ----
@@ -410,8 +443,6 @@ if not ptm.empty:
             ptm = ptm[ptm["PLYR"] == sel_plyr]
         else:
             ptm = ptm.iloc[0:0]
-
-    # Already sorted by P% desc in calc_tables; show as-is
     display_with_index(ptm, compact_cols_config(include_tmf_width=220))
 else:
     st.info("Add draft rows (Player, PLYR, Team, PointType) to your Google Sheet to see results.")
@@ -450,9 +481,9 @@ with colB:
 st.divider()
 with st.expander("ℹ️ Notes / Tips"):
     st.markdown(f"""
-- **Google Sheet Tab:** `{DRAFT_TAB}` • **Columns:** `Player, PLYR (<=6), Team, PointType, TeamAbbr (optional)`
-- **TMF (top table):** comma-separated team abbreviations (from TM).
-- **Use exact full team names** in `Team` to match ESPN (or validate via the exported `Teams` tab).
-- **Season:** {SEASON} • **Standings source:** ESPN (cached ~15 min)
+- **Google Sheet Tab:** `{DRAFT_TAB}` • Columns: `Player, PLYR (<=6), Team, PointType, TeamAbbr (optional)`
+- **Enter Team as full name** (e.g., "Oklahoma City Thunder"). Abbreviations go in **TeamAbbr** only.
+- Use the **Hard refresh** if the app just woke up and standings look stale.
+- **Season:** {SEASON} • Source: ESPN (cached ~15 min)
 - **Guards:** Max 6 teams per player; a team can't belong to multiple players.
 """)
