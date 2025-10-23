@@ -333,7 +333,7 @@ except Exception as e:
     st.stop()
 
 # Diagnostics: counts + mismatches
-diag_cols = st.columns([1,1,1,5])
+diag_cols = st.columns([1, 1, 1, 5])
 with diag_cols[0]:
     st.metric("Draft rows", len(draft_df))
 with diag_cols[1]:
@@ -341,8 +341,10 @@ with diag_cols[1]:
 with diag_cols[2]:
     espn_set = set(standings_df["Team"].apply(normalize_team_name))
     typed = draft_df["Team"].apply(normalize_team_name)
-    st.metric("Teams matched", int((typed.isin(espn_set)) & (typed != "")).sum())
-
+    total_drafted = int((typed != "").sum())
+    matched_count = int(((typed.isin(espn_set)) & (typed != "")).sum())
+    st.metric("Teams matched", f"{matched_count}/{total_drafted}")
+    
 # Mismatch table with suggestions
 bad = draft_df[
     (draft_df["Team"].fillna("") != "") &
