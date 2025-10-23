@@ -1,13 +1,13 @@
 # app.py — NBA Wins/Losses Pool Tracker (Google Sheets + ESPN)
 # ------------------------------------------------------------
-# Updates in this build:
-# - "Hard refresh (no cache)" button to fully bypass Streamlit cache for ESPN
-# - Stricter team normalization from Google Sheet (strip/condense spaces)
-# - Diagnostics panel (counts + mismatch table with suggestions)
-# - More robust ESPN parser: scans children + root standings fallback
+# This build:
+# - Fixes AttributeError by using a version-proof rerun helper
+# - "Hard refresh (no cache)" + normal refresh buttons
+# - Robust ESPN parser (East+West; root fallback)
+# - Stricter team-name normalization; diagnostics & mismatch hints
 # - Default sort: Player & Per-Team by P% desc; NBA standings alphabetical
-# - Short headers, compact widths, 1-decimal percentages (no % in values)
-# - PLYR (<=6) used for colors & legend; TMF shows comma-separated TM abbreviations
+# - Short headers; compact widths; 1-decimal percentages (no % sign in values)
+# - PLYR (<=6) used for colors & legend; TMF shows comma-separated team abbreviations
 
 import re
 import difflib
@@ -30,6 +30,13 @@ PLAYER_COLORS = [
     "#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2",
     "#F2CF5B", "#B279A2", "#FF9DA6", "#9D755D", "#BAB0AC",
 ]
+
+# ---- Streamlit rerun compatibility (works on old & new versions)
+def force_rerun():
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:  # older Streamlit
+        st.experimental_rerun()
 
 # ----------------------------
 # Google Sheets client helpers
@@ -75,7 +82,9 @@ def read_draft(gc) -> pd.DataFrame:
     df["PLYR"]   = df["PLYR"].fillna("").astype(str).apply(lambda s: s[:6])
     df["Team"]   = df["Team"].fillna("").astype(str).apply(normalize_team_name)
     df["PointType"] = (
-        df["PointType"].fillna("Wins").astype(str).apply(lambda x: "Wins" if x.strip().lower().startswith("win") else "Losses")
+        df["PointType"].fillna("Wins").astype(str).apply(
+            lambda x: "Wins" if x.strip().lower().startswith("win") else "Losses"
+        )
     )
 
     # Prefer explicit TeamAbbr, else legacy Abbr, else blank (will fallback to ESPN later)
@@ -293,7 +302,7 @@ colR, colBlank = st.columns([1, 9])
 with colR:
     if st.button("🔧 Hard refresh (no cache)"):
         fetch_nba_standings.clear()
-        st.experimental_rerun()
+        force_rerun()
 
 # Normal (cached) fetch
 try:
@@ -308,7 +317,7 @@ except Exception as e:
 with st.sidebar:
     if st.button("🔄 Refresh data (clear cache)"):
         fetch_nba_standings.clear()
-        st.experimental_rerun()
+        force_rerun()
 
 # Sheets
 gc = get_sheets_client()
@@ -330,16 +339,15 @@ with diag_cols[0]:
 with diag_cols[1]:
     st.metric("ESPN teams", len(standings_df))
 with diag_cols[2]:
-    # how many match
     espn_set = set(standings_df["Team"].apply(normalize_team_name))
     typed = draft_df["Team"].apply(normalize_team_name)
     st.metric("Teams matched", int((typed.isin(espn_set)) & (typed != "")).sum())
 
 # Mismatch table with suggestions
-team_set = set(team_list)
-bad = draft_df[(draft_df["Team"].fillna("") != "") & (~draft_df["Team"].apply(normalize_team_name).isin(
-    set(standings_df["Team"].apply(normalize_team_name))
-))][["Player", "PLYR", "Team"]].copy()
+bad = draft_df[
+    (draft_df["Team"].fillna("") != "") &
+    (~draft_df["Team"].apply(normalize_team_name).isin(set(standings_df["Team"].apply(normalize_team_name))))
+][["Player", "PLYR", "Team"]].copy()
 
 if not bad.empty:
     bad["Suggestions"] = bad["Team"].apply(
@@ -388,7 +396,7 @@ if st.sidebar.button("💾 Save Draft to Google Sheets"):
     entries = df_clean[["Player", "PLYR", "Team", "PointType", "TeamAbbr"]].to_dict(orient="records")
     write_draft(gc, entries)
     st.sidebar.success("Draft saved to Google Sheets ✅")
-    st.experimental_rerun()
+    force_rerun()
 
 # Calculate (sorted by P% desc inside)
 player_table_raw, per_team_table_raw = calc_tables(editable_df, standings_df)
@@ -483,7 +491,7 @@ with st.expander("ℹ️ Notes / Tips"):
     st.markdown(f"""
 - **Google Sheet Tab:** `{DRAFT_TAB}` • Columns: `Player, PLYR (<=6), Team, PointType, TeamAbbr (optional)`
 - **Enter Team as full name** (e.g., "Oklahoma City Thunder"). Abbreviations go in **TeamAbbr** only.
-- Use the **Hard refresh** if the app just woke up and standings look stale.
+- Use **Hard refresh** if the app just woke up and standings look stale.
 - **Season:** {SEASON} • Source: ESPN (cached ~15 min)
 - **Guards:** Max 6 teams per player; a team can't belong to multiple players.
 """)
