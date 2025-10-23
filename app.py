@@ -123,53 +123,51 @@ def export_teams_tab(gc, sheet_id, teams):
 # ----------------------------
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_nba_standings() -> pd.DataFrame:
-    """
-    Returns DataFrame with columns: Team, Abbr, W, L, WinPct (0..1).
-    Robust parser: scans children (East/West) and root standings.
-    """
-    url = "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/standings"
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-
-    rows_map = {}  # team_id -> dict
-
-    def harvest(standings_block):
-        for entry in standings_block.get("entries", []):
-            team = entry.get("team", {}) or {}
-            team_id = team.get("id") or team.get("uid") or (team.get("displayName") or team.get("name"))
-            name = team.get("displayName") or team.get("name")
-            abbr = team.get("abbreviation") or team.get("shortDisplayName")
-            stats_list = entry.get("stats", []) or []
-            stats = {s.get("id"): s.get("value") for s in stats_list if isinstance(s, dict) and "id" in s}
-            w = int(stats.get("wins", 0) or 0)
-            l = int(stats.get("losses", 0) or 0)
-            gp = w + l
-            winpct = float(stats.get("winPercent", 0) or (w / gp if gp else 0))
-            rows_map[team_id] = {"Team": name, "Abbr": abbr, "W": w, "L": l, "WinPct": winpct}
-
-    # Try children blocks (usual East/West)
-    children = data.get("children", [])
-    found_any = False
-    for ch in children:
-        if isinstance(ch, dict) and "standings" in ch:
-            harvest(ch["standings"])
-            found_any = True
-
-    # Fallback: standings at root
-    if not found_any and "standings" in data:
-        harvest(data["standings"])
-
-    if not rows_map:
-        raise RuntimeError("No standings rows parsed from ESPN")
-
-    df = pd.DataFrame(list(rows_map.values()))
-    df["Team"] = df["Team"].astype(str)
-    df["W"] = df["W"].astype(int)
-    df["L"] = df["L"].astype(int)
-    df["WinPct"] = df["WinPct"].astype(float)
-    # Keep alphabetical default for the raw standings table
-    return df.sort_values("Team").reset_index(drop=True)
+    """Fetch NBA standings (ESPN API, with fallback)."""
+    urls = [
+        "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/standings",
+        "https://cdn.espn.com/core/nba/standings?xhr=1"
+    ]
+    for url in urls:
+        try:
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            # new format (cdn.espn.com) – teams nested under children → standings → entries
+            if "content" in data and "standings" in data["content"]:
+                groups = data["content"]["standings"].get("groups", [])
+                rows = []
+                for g in groups:
+                    for t in g.get("standings", {}).get("entries", []):
+                        team = t["team"]["displayName"]
+                        abbr = t["team"].get("abbreviation") or team[:3].upper()
+                        stats = {s["name"]: s.get("value") for s in t.get("stats", [])}
+                        w = int(stats.get("wins", 0))
+                        l = int(stats.get("losses", 0))
+                        gp = w + l
+                        wpct = float(stats.get("winPercent", 0) or (w / gp if gp else 0))
+                        rows.append({"Team": team, "Abbr": abbr, "W": w, "L": l, "WinPct": wpct})
+                if rows:
+                    return pd.DataFrame(rows).sort_values("Team").reset_index(drop=True)
+            # older v2 format (site.web.api)
+            if "children" in data:
+                rows_map = {}
+                for ch in data["children"]:
+                    if "standings" in ch:
+                        for e in ch["standings"]["entries"]:
+                            team = e["team"]["displayName"]
+                            abbr = e["team"].get("abbreviation") or team[:3].upper()
+                            stats = {s["id"]: s.get("value") for s in e["stats"]}
+                            w = int(stats.get("wins", 0))
+                            l = int(stats.get("losses", 0))
+                            gp = w + l
+                            wpct = float(stats.get("winPercent", 0) or (w / gp if gp else 0))
+                            rows_map[team] = {"Team": team, "Abbr": abbr, "W": w, "L": l, "WinPct": wpct}
+                if rows_map:
+                    return pd.DataFrame(list(rows_map.values())).sort_values("Team").reset_index(drop=True)
+        except Exception:
+            continue
+    raise RuntimeError("Could not parse NBA standings from ESPN.")
 
 # ----------------------------
 # Helpers
