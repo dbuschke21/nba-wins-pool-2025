@@ -123,51 +123,140 @@ def export_teams_tab(gc, sheet_id, teams):
 # ----------------------------
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_nba_standings() -> pd.DataFrame:
-    """Fetch NBA standings (ESPN API, with fallback)."""
+    """
+    Returns DataFrame with columns: Team, Abbr, W, L, WinPct (0..1).
+    Robust: tries two ESPN endpoints and multiple record shapes.
+    """
+    import re
+
+    def extract_w_l_pct_from_entry(team_dict, stats_list, records_list):
+        # defaults
+        W = L = None
+        WPCT = None
+
+        # 1) stats list (various keys ESPN uses)
+        stats = {}
+        for s in stats_list or []:
+            # support both id/name and value/displayValue
+            k = s.get("id") or s.get("name")
+            if k:
+                stats[k] = s
+
+        def num(k):
+            if k in stats:
+                v = stats[k].get("value")
+                if v is None:
+                    dv = stats[k].get("displayValue")
+                    if isinstance(dv, (int, float)):
+                        return dv
+                    # e.g. "12" or "12-8"
+                    if isinstance(dv, str) and dv.isdigit():
+                        return int(dv)
+                if isinstance(v, (int, float)):
+                    return v
+            return None
+
+        W = num("wins") if W is None else W
+        L = num("losses") if L is None else L
+        WPCT = num("winPercent") if WPCT is None else WPCT
+        if WPCT is None:
+            # sometimes winPercentV2
+            WPCT = num("winPercentV2")
+
+        # 2) If W/L still missing, parse records.summary like "12-8"
+        if (W is None or L is None) and records_list:
+            for rec in records_list:
+                name = (rec.get("name") or rec.get("type") or "").lower()
+                # pick an overall/total/regular record
+                if any(key in name for key in ["overall", "total", "regular"]):
+                    summary = rec.get("summary") or rec.get("displayValue") or ""
+                    m = re.match(r"^\s*(\d+)\s*-\s*(\d+)", summary)
+                    if m:
+                        W = int(m.group(1))
+                        L = int(m.group(2))
+                        break
+
+        # 3) Compute pct if we now have W/L
+        if (WPCT is None or WPCT == 0) and isinstance(W, int) and isinstance(L, int) and (W + L) > 0:
+            WPCT = W / (W + L)
+
+        # sanitize
+        W = int(W) if isinstance(W, (int, float)) else 0
+        L = int(L) if isinstance(L, (int, float)) else 0
+        WPCT = float(WPCT) if isinstance(WPCT, (int, float)) else (W / (W + L) if (W + L) > 0 else 0.0)
+        return W, L, WPCT
+
+    # Try both shapes/endpoints
     urls = [
         "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/standings",
-        "https://cdn.espn.com/core/nba/standings?xhr=1"
+        "https://cdn.espn.com/core/nba/standings?xhr=1",
     ]
+
     for url in urls:
         try:
             r = requests.get(url, timeout=15)
             r.raise_for_status()
             data = r.json()
-            # new format (cdn.espn.com) – teams nested under children → standings → entries
-            if "content" in data and "standings" in data["content"]:
+
+            rows = []
+
+            # ---- Newer cdn.espn.com shape
+            if isinstance(data, dict) and "content" in data and "standings" in data["content"]:
                 groups = data["content"]["standings"].get("groups", [])
-                rows = []
                 for g in groups:
-                    for t in g.get("standings", {}).get("entries", []):
-                        team = t["team"]["displayName"]
-                        abbr = t["team"].get("abbreviation") or team[:3].upper()
-                        stats = {s["name"]: s.get("value") for s in t.get("stats", [])}
-                        w = int(stats.get("wins", 0))
-                        l = int(stats.get("losses", 0))
-                        gp = w + l
-                        wpct = float(stats.get("winPercent", 0) or (w / gp if gp else 0))
-                        rows.append({"Team": team, "Abbr": abbr, "W": w, "L": l, "WinPct": wpct})
-                if rows:
-                    return pd.DataFrame(rows).sort_values("Team").reset_index(drop=True)
-            # older v2 format (site.web.api)
-            if "children" in data:
-                rows_map = {}
+                    entries = g.get("standings", {}).get("entries", []) or g.get("entries", [])
+                    for e in entries:
+                        team = e.get("team", {}) or {}
+                        name = team.get("displayName") or team.get("name") or team.get("shortDisplayName")
+                        abbr = team.get("abbreviation") or (name[:3].upper() if name else "")
+                        stats_list = e.get("stats", []) or e.get("standings", {}).get("stats", [])
+                        records_list = e.get("records", [])
+                        w, l, wp = extract_w_l_pct_from_entry(team, stats_list, records_list)
+                        if name:
+                            rows.append({"Team": name, "Abbr": abbr, "W": w, "L": l, "WinPct": wp})
+
+            # ---- site.web.api shape with children/standings
+            if not rows and "children" in data:
                 for ch in data["children"]:
-                    if "standings" in ch:
-                        for e in ch["standings"]["entries"]:
-                            team = e["team"]["displayName"]
-                            abbr = e["team"].get("abbreviation") or team[:3].upper()
-                            stats = {s["id"]: s.get("value") for s in e["stats"]}
-                            w = int(stats.get("wins", 0))
-                            l = int(stats.get("losses", 0))
-                            gp = w + l
-                            wpct = float(stats.get("winPercent", 0) or (w / gp if gp else 0))
-                            rows_map[team] = {"Team": team, "Abbr": abbr, "W": w, "L": l, "WinPct": wpct}
-                if rows_map:
-                    return pd.DataFrame(list(rows_map.values())).sort_values("Team").reset_index(drop=True)
+                    stg = ch.get("standings")
+                    if not stg:
+                        continue
+                    for e in stg.get("entries", []):
+                        team = e.get("team", {}) or {}
+                        name = team.get("displayName") or team.get("name") or team.get("shortDisplayName")
+                        abbr = team.get("abbreviation") or (name[:3].upper() if name else "")
+                        stats_list = e.get("stats", [])
+                        records_list = e.get("records", [])
+                        w, l, wp = extract_w_l_pct_from_entry(team, stats_list, records_list)
+                        if name:
+                            rows.append({"Team": name, "Abbr": abbr, "W": w, "L": l, "WinPct": wp})
+
+            # ---- site.web.api shape with standings at root
+            if not rows and "standings" in data:
+                for e in data["standings"].get("entries", []):
+                    team = e.get("team", {}) or {}
+                    name = team.get("displayName") or team.get("name") or team.get("shortDisplayName")
+                    abbr = team.get("abbreviation") or (name[:3].upper() if name else "")
+                    stats_list = e.get("stats", [])
+                    records_list = e.get("records", [])
+                    w, l, wp = extract_w_l_pct_from_entry(team, stats_list, records_list)
+                    if name:
+                        rows.append({"Team": name, "Abbr": abbr, "W": w, "L": l, "WinPct": wp})
+
+            if rows:
+                df = pd.DataFrame(rows)
+                # ESPN can duplicate teams across groups; keep the row with the largest GP
+                df["GP"] = df["W"] + df["L"]
+                df = df.sort_values(["Team", "GP"], ascending=[True, False]).drop_duplicates("Team", keep="first")
+                df = df.drop(columns=["GP"], errors="ignore")
+                return df.sort_values("Team").reset_index(drop=True)
+
         except Exception:
+            # try next url
             continue
+
     raise RuntimeError("Could not parse NBA standings from ESPN.")
+
 
 # ----------------------------
 # Helpers
