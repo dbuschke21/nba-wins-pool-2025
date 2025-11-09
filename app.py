@@ -1,13 +1,12 @@
 # app.py — NBA Wins/Losses Pool Tracker (Google Sheets + ESPN)
 # ------------------------------------------------------------
 # This build:
-# - Player Standings: adds NP (Non-points) next to P; moves GP left; removes W/L/W% from this table
-# - Weekly trend chart below first table (auto-logs to Google Sheets "History" tab by ISO week)
-# - Robust ESPN parser (multiple shapes); "Hard refresh (no cache)" + version-proof rerun
-# - Stricter team-name normalization; diagnostics & mismatch hints
-# - Default sort: Player & Per-Team by P% desc; NBA standings alphabetical
-# - Short headers; compact widths; 1-decimal percentages (no % sign in values)
-# - PLYR (<=6) used for colors & legend; TMF shows comma-separated team abbreviations
+# - Player Standings: PLYR column moved left of GP (order: PLYR, GP, P, NP, P%, TMF)
+# - Weekly chart: plots per-week points (delta vs prior week) by PLYR,
+#   limited to the FIRST THREE weeks of the season (from History tab).
+# - Robust ESPN parser; hard-refresh button with version-proof rerun
+# - History tab auto-snapshots weekly totals
+# - Compact widths & 1-decimal % values; mismatch diagnostics
 
 import re
 import difflib
@@ -20,13 +19,15 @@ from google.oauth2.service_account import Credentials
 from streamlit import column_config
 import altair as alt
 
+APP_VERSION = "build-3wk-weekly-plot"
+
 # ----------------------------
 # Configuration
 # ----------------------------
-SEASON = "2025-26"  # update each year
+SEASON = "2025-26"          # update each year
 SHEET_ID = st.secrets["SHEET_ID"]
-DRAFT_TAB = "Draft"     # Worksheet tab for draft data
-HISTORY_TAB = "History" # Worksheet tab for weekly snapshots
+DRAFT_TAB = "Draft"         # Worksheet for draft data
+HISTORY_TAB = "History"     # Worksheet for weekly snapshots
 
 # Player colors (extend if needed)
 PLAYER_COLORS = [
@@ -42,7 +43,7 @@ def force_rerun():
         st.experimental_rerun()
 
 # ----------------------------
-# Google Sheets client helpers
+# Google Sheets helpers
 # ----------------------------
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -72,15 +73,11 @@ def ensure_draft_tab(gc):
 def ensure_history_tab(gc):
     sh = gc.open_by_key(SHEET_ID)
     return ensure_tab(
-        sh,
-        HISTORY_TAB,
-        rows=1000,
-        cols=8,
+        sh, HISTORY_TAB, rows=1000, cols=8,
         header=["DateUTC", "WeekStart", "PLYR", "P", "GP", "NP", "P%"]
     )
 
 def normalize_team_name(s: str) -> str:
-    """Trim and condense internal whitespace so 'Los  Angeles  Lakers' -> 'Los Angeles Lakers'."""
     s = (s or "").strip()
     s = re.sub(r"\s{2,}", " ", s)
     return s
@@ -90,26 +87,21 @@ def read_draft(gc) -> pd.DataFrame:
     rows = ws.get_all_records()
     df = pd.DataFrame(rows)
 
-    # Ensure columns exist
     for col in ["Player", "PLYR", "Team", "PointType", "TeamAbbr", "Abbr"]:
         if col not in df.columns:
             df[col] = ""
 
-    # Normalize
     df["Player"] = df["Player"].fillna("").astype(str)
     df["PLYR"]   = df["PLYR"].fillna("").astype(str).apply(lambda s: s[:6])
     df["Team"]   = df["Team"].fillna("").astype(str).apply(normalize_team_name)
     df["PointType"] = (
-        df["PointType"].fillna("Wins").astype(str).apply(
-            lambda x: "Wins" if x.strip().lower().startswith("win") else "Losses"
-        )
+        df["PointType"].fillna("Wins").astype(str)
+        .apply(lambda x: "Wins" if x.strip().lower().startswith("win") else "Losses")
     )
 
-    # Prefer explicit TeamAbbr, else legacy Abbr, else blank (will fallback to ESPN later)
     df["TeamAbbr"] = df.get("TeamAbbr", "").replace("", pd.NA)
     df["Abbr"] = df.get("Abbr", "").replace("", pd.NA)
     df["TeamAbbr"] = df["TeamAbbr"].fillna(df["Abbr"]).fillna("")
-
     return df[["Player", "PLYR", "Team", "PointType", "TeamAbbr"]]
 
 def write_draft(gc, entries):
@@ -141,16 +133,10 @@ def export_teams_tab(gc, sheet_id, teams):
 # ----------------------------
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_nba_standings() -> pd.DataFrame:
-    """
-    Returns DataFrame with columns: Team, Abbr, W, L, WinPct (0..1).
-    Robust: tries two ESPN endpoints and multiple record shapes.
-    """
+    """Returns DataFrame with columns: Team, Abbr, W, L, WinPct (0..1)."""
     def extract_w_l_pct_from_entry(team_dict, stats_list, records_list):
-        # defaults
         W = L = None
         WPCT = None
-
-        # stats list (various keys ESPN uses)
         stats = {}
         for s in stats_list or []:
             k = s.get("id") or s.get("name")
@@ -162,12 +148,9 @@ def fetch_nba_standings() -> pd.DataFrame:
                 v = stats[k].get("value")
                 if v is None:
                     dv = stats[k].get("displayValue")
-                    if isinstance(dv, (int, float)):
-                        return dv
-                    if isinstance(dv, str) and dv.isdigit():
-                        return int(dv)
-                if isinstance(v, (int, float)):
-                    return v
+                    if isinstance(dv, (int, float)): return dv
+                    if isinstance(dv, str) and dv.isdigit(): return int(dv)
+                if isinstance(v, (int, float)): return v
             return None
 
         W = num("wins") if W is None else W
@@ -176,15 +159,14 @@ def fetch_nba_standings() -> pd.DataFrame:
         if WPCT is None:
             WPCT = num("winPercentV2")
 
-        # If W/L missing, parse records.summary like "12-8"
         if (W is None or L is None) and records_list:
             for rec in records_list:
                 name = (rec.get("name") or rec.get("type") or "").lower()
-                if any(key in name for key in ["overall", "total", "regular"]):
+                if any(k in name for k in ["overall", "total", "regular"]):
                     summary = rec.get("summary") or rec.get("displayValue") or ""
                     m = re.match(r"^\s*(\d+)\s*-\s*(\d+)", summary)
                     if m:
-                        W = int(m.group(1)); L = int(m.group(2))
+                        W, L = int(m.group(1)), int(m.group(2))
                         break
 
         if (WPCT is None or WPCT == 0) and isinstance(W, int) and isinstance(L, int) and (W + L) > 0:
@@ -199,16 +181,13 @@ def fetch_nba_standings() -> pd.DataFrame:
         "https://site.web.api.espn.com/apis/v2/sports/basketball/nba/standings",
         "https://cdn.espn.com/core/nba/standings?xhr=1",
     ]
-
     for url in urls:
         try:
             r = requests.get(url, timeout=15)
             r.raise_for_status()
             data = r.json()
-
             rows = []
 
-            # Newer cdn.espn.com shape
             if isinstance(data, dict) and "content" in data and "standings" in data["content"]:
                 groups = data["content"]["standings"].get("groups", [])
                 for g in groups:
@@ -223,7 +202,6 @@ def fetch_nba_standings() -> pd.DataFrame:
                         if name:
                             rows.append({"Team": name, "Abbr": abbr, "W": w, "L": l, "WinPct": wp})
 
-            # site.web.api shape with children/standings
             if not rows and "children" in data:
                 for ch in data["children"]:
                     stg = ch.get("standings")
@@ -239,7 +217,6 @@ def fetch_nba_standings() -> pd.DataFrame:
                         if name:
                             rows.append({"Team": name, "Abbr": abbr, "W": w, "L": l, "WinPct": wp})
 
-            # site.web.api shape with standings at root
             if not rows and "standings" in data:
                 for e in data["standings"].get("entries", []):
                     team = e.get("team", {}) or {}
@@ -253,16 +230,14 @@ def fetch_nba_standings() -> pd.DataFrame:
 
             if rows:
                 df = pd.DataFrame(rows)
-                # ESPN can duplicate teams across groups; keep the row with the largest GP
                 df["GP"] = df["W"] + df["L"]
                 df = df.sort_values(["Team", "GP"], ascending=[True, False]).drop_duplicates("Team", keep="first")
                 df = df.drop(columns=["GP"], errors="ignore")
                 return df.sort_values("Team").reset_index(drop=True)
-
         except Exception:
             continue
-
     raise RuntimeError("Could not parse NBA standings from ESPN.")
+
 # ----------------------------
 # Helpers
 # ----------------------------
@@ -279,9 +254,7 @@ def style_by_plyr(df, plyr_col, cmap):
         color = cmap.get(r[plyr_col], "#FFFFFF")
         return [f"background-color: {color}22"] * len(r)
     styler = df.style.apply(_row_style, axis=1)
-    # Explicit numeric formatting for % columns
-    fmt = {"P%": "{:.1f}"}
-    return styler.format(fmt)
+    return styler.format({"P%": "{:.1f}"})
 
 def add_index(df):
     if df.empty:
@@ -291,19 +264,17 @@ def add_index(df):
     return df
 
 def compact_cols_config_player(include_tmf_width=220):
-    # For the Player Standings table
     return {
-        "#":   column_config.NumberColumn("#", width=40),
-        "GP":  column_config.NumberColumn("GP", width=40),
-        "PLYR":column_config.TextColumn("PLYR", width=40),
-        "P":   column_config.NumberColumn("P", width=30),
-        "NP":  column_config.NumberColumn("NP", width=30),
-        "P%":  column_config.NumberColumn("P%", width=40, format="%.1f"),
-        "TMF": column_config.TextColumn("TMF", width=include_tmf_width),
+        "#":    column_config.NumberColumn("#", width=40),
+        "PLYR": column_config.TextColumn("PLYR", width=40),   # now left of GP
+        "GP":   column_config.NumberColumn("GP", width=40),
+        "P":    column_config.NumberColumn("P", width=30),
+        "NP":   column_config.NumberColumn("NP", width=30),
+        "P%":   column_config.NumberColumn("P%", width=40, format="%.1f"),
+        "TMF":  column_config.TextColumn("TMF", width=include_tmf_width),
     }
 
 def compact_cols_config_perteam(include_tmf_width=220):
-    # For the per-team breakdown table (unchanged from before)
     return {
         "#":   column_config.NumberColumn("#", width=40),
         "PLYR":column_config.TextColumn("PLYR", width=40),
@@ -322,7 +293,6 @@ def compact_cols_config_perteam(include_tmf_width=220):
 # Calculations
 # ----------------------------
 def calc_tables(draft_df: pd.DataFrame, standings: pd.DataFrame):
-    # Build lookup dicts
     standings["TeamNorm"] = standings["Team"].apply(normalize_team_name)
     team_stats = standings.set_index("TeamNorm")[["W", "L", "WinPct"]].to_dict(orient="index")
     abbr_map   = standings.set_index("TeamNorm")["Abbr"].to_dict()
@@ -344,54 +314,39 @@ def calc_tables(draft_df: pd.DataFrame, standings: pd.DataFrame):
 
         GP = W + L
         points = W if pt == "Wins" else L
-        non_points = L if pt == "Wins" else W  # missed points
+        non_points = L if pt == "Wins" else W
         tm_abbr = (r.get("TeamAbbr", "") or "").strip() or abbr_map.get(team_key, "")
 
-        rows.append(
-            {
-                "PLYR": plyr,
-                "P_FULL": player,
-                "TM": tm_abbr,
-                "PT": pt_short,
-                "P": int(points),
-                "NP": int(non_points),
-                "P%": round((points / GP) * 100, 1) if GP else 0.0,
-                "W": int(W),
-                "L": int(L),
-                "W%": round((W / GP) * 100, 1) if GP else 0.0,
-                "GP": int(GP),
-                "TMF": team,  # full team name (input)
-            }
-        )
+        rows.append({
+            "PLYR": plyr,
+            "P_FULL": player,
+            "TM": tm_abbr,
+            "PT": pt_short,
+            "P": int(points),
+            "NP": int(non_points),
+            "P%": round((points / GP) * 100, 1) if GP else 0.0,
+            "W": int(W),
+            "L": int(L),
+            "W%": round((W / GP) * 100, 1) if GP else 0.0,
+            "GP": int(GP),
+            "TMF": team,
+        })
 
     per_team_df = pd.DataFrame(rows)
 
-    # ---- Build Player Standings aggregate (GP, P, NP, P%, TMF of abbreviations)
     if per_team_df.empty:
         player_table = pd.DataFrame(columns=["PLYR", "GP", "P", "NP", "P%", "TMF"])
     else:
-        agg = (
-            per_team_df.groupby(["PLYR"], as_index=False)
-            .agg(
-                P=("P", "sum"),
-                NP=("NP", "sum"),
-                GP=("GP", "sum")
-            )
-        )
+        agg = (per_team_df.groupby(["PLYR"], as_index=False)
+               .agg(P=("P", "sum"), NP=("NP", "sum"), GP=("GP", "sum")))
         agg["P%"] = round((agg["P"] / agg["GP"].replace(0, pd.NA)) * 100, 1).fillna(0.0)
 
-        # TMF for top table = comma-separated abbreviations (TM)
-        tm_list = (
-            per_team_df.groupby("PLYR")["TM"]
-            .apply(lambda s: ", ".join([t for t in s.tolist() if t]))
-            .reset_index(name="TMF")
-        )
+        tm_list = (per_team_df.groupby("PLYR")["TM"]
+                   .apply(lambda s: ", ".join([t for t in s.tolist() if t]))
+                   .reset_index(name="TMF"))
         player_table = agg.merge(tm_list, on="PLYR", how="left").fillna({"TMF": ""})
-
-        # Default sort by P% desc (then P, then GP)
         player_table = player_table.sort_values(["P%", "P", "GP"], ascending=[False, False, False]).reset_index(drop=True)
 
-    # ---- Per-team default sort by P% desc (then P, then W)
     if not per_team_df.empty:
         per_team_df = per_team_df.sort_values(["P%", "P", "W"], ascending=[False, False, False]).reset_index(drop=True)
 
@@ -401,7 +356,6 @@ def calc_tables(draft_df: pd.DataFrame, standings: pd.DataFrame):
 # History (weekly snapshots)
 # ----------------------------
 def week_start_monday_utc(ts_utc: datetime) -> str:
-    # convert to pandas period week (Mon) and get start date as ISO string
     p = pd.Timestamp(ts_utc).to_period("W-MON")
     return p.start_time.strftime("%Y-%m-%d")
 
@@ -413,7 +367,6 @@ def read_history(gc) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 def upsert_history(gc, player_table: pd.DataFrame):
-    """Append/update one row per (WeekStart, PLYR) with the latest totals."""
     if player_table.empty:
         return
     ws = ensure_history_tab(gc)
@@ -422,11 +375,10 @@ def upsert_history(gc, player_table: pd.DataFrame):
     now_utc = datetime.now(timezone.utc)
     week_start = week_start_monday_utc(now_utc)
 
-    # Build rows to upsert
     new_rows = player_table[["PLYR", "P", "GP", "NP", "P%"]].copy()
     new_rows.insert(0, "WeekStart", week_start)
     new_rows.insert(0, "DateUTC", now_utc.strftime("%Y-%m-%d %H:%M:%S"))
-    # If same (WeekStart, PLYR) exists, replace; else append
+
     if not hist.empty:
         key = ["WeekStart", "PLYR"]
         hist = hist.drop_duplicates(subset=key, keep="last")
@@ -435,7 +387,6 @@ def upsert_history(gc, player_table: pd.DataFrame):
     else:
         cur = new_rows
 
-    # Write back
     values = [list(cur.columns)] + cur.astype(str).values.tolist()
     ws.clear()
     ws.update(values)
@@ -445,13 +396,14 @@ def upsert_history(gc, player_table: pd.DataFrame):
 # ----------------------------
 st.set_page_config(page_title="NBA Draft Tracker", page_icon="🏀", layout="wide")
 st.title("🏀 NBA Wins/Losses Pool Tracker")
+st.caption(f"Version: {APP_VERSION}")
 st.caption(
     "Draft data is stored in your **Google Sheet** (tab 'Draft'). "
     "Each team earns points based on its 'PointType': 1 per Win or 1 per Loss. "
     "Standings update live from ESPN."
 )
 
-# Hard refresh up top
+# Hard refresh
 colR, colBlank = st.columns([1, 9])
 with colR:
     if st.button("🔧 Hard refresh (no cache)"):
@@ -529,7 +481,6 @@ editable_df = st.sidebar.data_editor(
     }
 )
 
-# Save guards
 if st.sidebar.button("💾 Save Draft to Google Sheets"):
     df_clean = editable_df.copy().fillna("")
     df_clean["Team"] = df_clean["Team"].apply(normalize_team_name)
@@ -576,45 +527,53 @@ if cmap:
     st.markdown(legend_html, unsafe_allow_html=True)
 
 def display_with_index(df, col_cfg, colorize=True):
-    df = add_index(df)
+    df = df.copy()
+    df.insert(0, "#", range(1, len(df) + 1))
     styled = style_by_plyr(df, "PLYR", cmap) if colorize and "PLYR" in df.columns else df
     st.dataframe(styled, use_container_width=True, hide_index=True, column_config=col_cfg)
 
-# ---- Player Standings (GP leftmost, P, NP, P%, TMF) ----
+# ---- Player Standings (PLYR left of GP; then P, NP, P%, TMF) ----
 st.divider()
 st.subheader("🏆 Player Standings")
-pt_display = player_table_raw[["PLYR", "P", "NP", "P%", "GP", "TMF"]].copy()
-# Move GP to first data column after #
-pt_display = pt_display[["GP", "PLYR", "P", "NP", "P%", "TMF"]]
+pt_display = player_table_raw[["PLYR", "GP", "P", "NP", "P%", "TMF"]].copy()
 display_with_index(pt_display, compact_cols_config_player(include_tmf_width=220))
 
-# ---- Update History + Weekly trend chart ----
+# ---- Update History + Weekly trend chart (first 3 weeks; per-week points) ----
 try:
+    # Snapshot weekly totals
     upsert_history(gc, player_table_raw)
     hist_df = read_history(gc)
     if not hist_df.empty:
-        # Ensure numeric
         for c in ["P", "GP", "NP", "P%"]:
             hist_df[c] = pd.to_numeric(hist_df[c], errors="coerce")
-        # Sort by week then PLYR
-        hist_df = hist_df.sort_values(["WeekStart", "PLYR"])
-        # Altair line chart: weekly P (points), by PLYR
-        base = alt.Chart(hist_df).encode(
+        # compute per-week points = P(current week) - P(previous week) per PLYR
+        hist_df = hist_df.sort_values(["PLYR", "WeekStart"])
+        hist_df["PrevP"] = hist_df.groupby("PLYR")["P"].shift(1).fillna(0)
+        hist_df["P_week"] = (hist_df["P"] - hist_df["PrevP"]).clip(lower=0)
+
+        # restrict to the FIRST three weeks present in History
+        weeks_sorted = sorted(hist_df["WeekStart"].unique().tolist())
+        first_three = weeks_sorted[:3]
+        hist3 = hist_df[hist_df["WeekStart"].isin(first_three)].copy()
+
+        if len(first_three) < 3:
+            st.info(f"History has {len(first_three)} week(s). The chart will expand as new weeks appear.")
+
+        # Plot per-week points by PLYR
+        base = alt.Chart(hist3).encode(
             x=alt.X("WeekStart:T", title="Week (Mon start)"),
-            y=alt.Y("P:Q", title="Points"),
+            y=alt.Y("P_week:Q", title="Points (this week)"),
             color=alt.Color("PLYR:N", legend=alt.Legend(orient="top", title=None)),
-            tooltip=["WeekStart:T", "PLYR:N", "P:Q", "GP:Q", "NP:Q", "P%:Q"]
+            tooltip=["WeekStart:T", "PLYR:N", "P_week:Q", "P:Q", "GP:Q", "NP:Q", "P%:Q"]
         )
-        line = base.mark_line().interactive()
-        pts  = base.mark_point()
-        st.subheader("Points by Week (PLYR)")
-        st.altair_chart(line + pts, use_container_width=True)
+        st.subheader("Weekly Points (first 3 weeks)")
+        st.altair_chart(base.mark_line() + base.mark_point(), use_container_width=True)
     else:
         st.info("History tab initialized. A weekly snapshot will be written automatically and the trend chart will appear on next load.")
 except Exception as e:
     st.warning(f"History logging skipped: {e}")
 
-# ---- Per-team breakdown (unchanged) ----
+# ---- Per-team breakdown ----
 st.divider()
 col1, col2 = st.columns([1, 3])
 with col1:
@@ -673,9 +632,9 @@ with colB:
 st.divider()
 with st.expander("ℹ️ Notes / Tips"):
     st.markdown(f"""
-- **Google Sheet Tabs:** `{DRAFT_TAB}` and `{HISTORY_TAB}` (auto).
-- **Player Standings:** GP, P, **NP** (missed points), and P% (no W/L here).
-- **NP definition:** If a team scores on **Wins**, NP counts that team’s **Losses**; if it scores on **Losses**, NP counts that team’s **Wins**.
-- **History:** App snapshots totals per ISO week (Mon start) to build the trend chart automatically.
+- **Tabs:** `{DRAFT_TAB}` and `{HISTORY_TAB}` (auto).
+- **Player Standings:** PLYR, GP, **P**, **NP**, P%, TMF.
+- **NP:** For Wins-picks it counts that team’s losses; for Losses-picks it counts that team’s wins.
+- **History & chart:** snapshots weekly totals; chart shows **per-week points** and is limited to the first 3 weeks available.
 - **Season:** {SEASON} • Source: ESPN (cached ~15 min).
 """)
